@@ -1,0 +1,7 @@
+_old/
+kanri-standalone.html
+server.py
+*.pyc
+__pycache__/
+.DS_Store
+Thumbs.db

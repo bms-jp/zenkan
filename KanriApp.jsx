@@ -1,0 +1,4008 @@
+const { useState, useEffect, useMemo, useCallback, useRef } = React;
+
+/* ============================================================
+   汎用フック・コンポーネント (V3 大量データ対応)
+   ============================================================ */
+// 入力値が止まってから ms 経過後に反映 (検索ボックスの全件スキャン抑制)
+function useDebounce(value, ms = 300) {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => { const t = setTimeout(() => setDebounced(value), ms); return () => clearTimeout(t); }, [value, ms]);
+  return debounced;
+}
+
+// 配列を表示用にスライスするページネーション (10万件規模のリスト表示でブラウザを止めない)
+function Pagination({ page, setPage, total, pageSize = 50 }) {
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  useEffect(() => { if(page > totalPages) setPage(totalPages); }, [totalPages, page, setPage]);
+  if(totalPages <= 1) return null;
+  const from = (page-1)*pageSize + 1;
+  const to = Math.min(page*pageSize, total);
+  return (
+    <div style={{display:"flex", alignItems:"center", justifyContent:"space-between", padding:"12px 16px", borderTop:"1px solid var(--border)", background:"var(--surface-2)", fontSize:12, color:"var(--muted)", flexWrap:"wrap", gap:8}}>
+      <div className="tabular">{from.toLocaleString()}–{to.toLocaleString()} / {total.toLocaleString()} 件</div>
+      <div style={{display:"flex", gap:6, alignItems:"center"}}>
+        <button className="btn btn-sm" onClick={() => setPage(1)} disabled={page <= 1}>«</button>
+        <button className="btn btn-sm" onClick={() => setPage(p => Math.max(1, p-1))} disabled={page <= 1}>‹ 前</button>
+        <span className="tabular" style={{minWidth:80, textAlign:"center"}}>{page} / {totalPages.toLocaleString()}</span>
+        <button className="btn btn-sm" onClick={() => setPage(p => Math.min(totalPages, p+1))} disabled={page >= totalPages}>次 ›</button>
+        <button className="btn btn-sm" onClick={() => setPage(totalPages)} disabled={page >= totalPages}>»</button>
+      </div>
+    </div>
+  );
+}
+
+// 検索ヘルパー: 全件スキャンを最大件数で打ち切り (10万件中ヒット50件以降はスキップ)
+function filterWithLimit(items, predicate, maxHits = 500) {
+  if(!predicate) return items;
+  const out = [];
+  for(let i = 0; i < items.length; i++) {
+    if(predicate(items[i])) {
+      out.push(items[i]);
+      if(out.length >= maxHits) break;
+    }
+  }
+  return out;
+}
+
+/* ==========================================================================
+   賃貸管理システム ― Kanri V2
+   ========================================================================== */
+
+const LS_KEY = "kanri_v2_data";
+const DEFAULT_SETTINGS = {
+  companyName: "○○管理株式会社", managementFeeRate: 5, consumptionTaxRate: 10, defaultDueDay: 27, bankAccount: "",
+  // AI連携 (Claude API直結 / 将来 BMS API Gatewayへスイッチ可能)
+  aiEnabled: false,
+  aiEndpoint: "https://api.anthropic.com/v1/messages",
+  aiApiKey: "",
+  aiModel: "claude-sonnet-4-5",
+  aiAuthMode: "direct", // "direct" = x-api-key (Anthropic直) / "gateway" = Authorization Bearer (BMS Gateway経由)
+  aiMaxTokens: 4096,
+};
+const emptyData = () => ({
+  owner:[], building:[], room:[], tenant:[], vendor:[],
+  application:[], contract:[], billing:[], payment:[], remittance:[], vendorPayment:[], ticket:[], repair:[], construction:[],
+  aiAnalysis:[], auditLog:[], settings: {...DEFAULT_SETTINGS}
+});
+/* ============================================================
+   IndexedDB ベース永続層 (V3)
+   - localStorage 5MB上限を撤廃 → GB単位まで保存可能
+   - 旧V2の localStorage データは初回起動時に自動移行
+   - 保存はデバウンス (500ms) で連続編集をまとめる
+   ============================================================ */
+const IDB_NAME = "kanri_v3";
+const IDB_VERSION = 1;
+const IDB_STORE = "kv";
+const IDB_KEY = "data";
+const LEGACY_LS_KEY = LS_KEY; // 旧 "kanri_v2_data"
+
+let _dbCache = null;
+function _openDB(){
+  if(_dbCache) return _dbCache;
+  _dbCache = new Promise((resolve, reject) => {
+    if(!window.indexedDB) { reject(new Error("IndexedDB未対応のブラウザです")); return; }
+    const req = indexedDB.open(IDB_NAME, IDB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if(!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+    req.onblocked = () => reject(new Error("IndexedDBがブロックされました(別タブで開かれた古いバージョンを閉じてください)"));
+  });
+  return _dbCache;
+}
+async function _idbGet(key){
+  const db = await _openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(IDB_STORE, "readonly");
+    const r = tx.objectStore(IDB_STORE).get(key);
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+async function _idbSet(key, val){
+  const db = await _openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(IDB_STORE, "readwrite");
+    tx.objectStore(IDB_STORE).put(val, key);
+    tx.oncomplete = () => res();
+    tx.onerror = () => rej(tx.error);
+    tx.onabort = () => rej(tx.error || new Error("transaction aborted"));
+  });
+}
+
+// Validates raw parsed data — same defensive logic as before, reusable
+// Also filters null / non-object elements within entity arrays to prevent
+// later .name access crashes from a hostile/corrupted import file.
+function _validateData(p){
+  if(!p || typeof p !== "object" || Array.isArray(p)) return emptyData();
+  const base = emptyData();
+  const result = {...base};
+  for(const k of Object.keys(base)) {
+    if(k === "settings") {
+      result.settings = (p.settings && typeof p.settings === "object" && !Array.isArray(p.settings))
+        ? {...DEFAULT_SETTINGS, ...p.settings} : {...DEFAULT_SETTINGS};
+    } else {
+      // Entity arrays: filter out null/non-object/array elements
+      result[k] = Array.isArray(p[k])
+        ? p[k].filter(x => x && typeof x === "object" && !Array.isArray(x))
+        : [];
+    }
+  }
+  return result;
+}
+
+async function loadAllAsync(){
+  try {
+    const idbVal = await _idbGet(IDB_KEY);
+    if(idbVal) return _validateData(idbVal);
+    // Migration from V2 localStorage if no IDB data yet
+    const raw = localStorage.getItem(LEGACY_LS_KEY);
+    if(raw) {
+      const parsed = JSON.parse(raw);
+      const validated = _validateData(parsed);
+      await _idbSet(IDB_KEY, validated);
+      console.info("[Kanri] V2 localStorage データを IndexedDB へ移行しました (localStorage側は念のため残置)");
+      return validated;
+    }
+    return emptyData();
+  } catch(e) {
+    console.error("[Kanri] 読込失敗:", e);
+    // Last resort: try localStorage directly
+    try { const raw = localStorage.getItem(LEGACY_LS_KEY); if(raw) return _validateData(JSON.parse(raw)); } catch {}
+    return emptyData();
+  }
+}
+
+let _saveTimer = null;
+let _savePromise = null;
+let _saveInflight = false;
+function saveAllAsync(d, immediate=false){
+  if(_saveTimer) { clearTimeout(_saveTimer); _saveTimer = null; }
+  return new Promise((resolve) => {
+    const doSave = async () => {
+      _saveInflight = true;
+      try {
+        await _idbSet(IDB_KEY, d);
+        if(window.__kanriSaveListener) window.__kanriSaveListener("ok");
+        resolve(true);
+      } catch(e) {
+        if(e && (e.name === "QuotaExceededError" || /quota/i.test(e.message||""))) {
+          if(!window.__kanriQuotaWarned) {
+            window.__kanriQuotaWarned = true;
+            alert("⚠️ IndexedDB容量上限に達しました。\n[設定] からバックアップを取得して、不要データを整理してください。");
+          }
+        } else {
+          console.error("[Kanri] 保存失敗:", e);
+        }
+        if(window.__kanriSaveListener) window.__kanriSaveListener("error");
+        resolve(false);
+      } finally { _saveInflight = false; }
+    };
+    if(immediate) doSave();
+    else _saveTimer = setTimeout(doSave, 500);
+  });
+}
+
+// Sync compatibility shims: keep API surface but warn if used (legacy code paths)
+function loadAll(){ console.warn("[Kanri] loadAll() is sync — use loadAllAsync() instead"); return emptyData(); }
+function saveAll(d){ saveAllAsync(d); return true; }
+
+// Approximate storage usage (still JSON-based estimate since IDB doesn't expose size cheaply)
+function getStorageUsage(d){ try { return new Blob([JSON.stringify(d)]).size; } catch { return 0; } }
+
+// CSV-safe cell escaper: prevents CSV injection (=,+,-,@,\t,\r prefix) AND quotes commas/newlines/quotes
+function csvCell(v){
+  if(v == null) return "";
+  let s = String(v);
+  // CSV injection prevention: prefix with single quote if leads with formula trigger chars
+  if(/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+  // Quote if contains quote, comma, newline, or tab
+  if(/[",\n\r\t]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+// Build full CSV from array-of-arrays
+function buildCsv(rows){ return "\ufeff" + rows.map(r => r.map(csvCell).join(",")).join("\n"); }
+// Convert entity items (master or ops) to CSV with localized headers and resolved refs
+function entityToCsv(cfg, items, data){
+  // Flatten all fields across sections
+  const fields = cfg.sections.flatMap(s => s.fields);
+  const headers = fields.map(f => f.label);
+  const rows = [headers];
+  for(const item of items){
+    rows.push(fields.map(f => {
+      const v = item[f.key];
+      if(v == null || v === "") return "";
+      if(f.type === "ref" && f.refEntity) return refLabel(data, f.refEntity, v);
+      if(f.type === "money") return Number(v) || 0;
+      return v;
+    }));
+  }
+  return buildCsv(rows);
+}
+// Trigger browser download of text content
+function downloadFile(filename, content, type){
+  const blob = new Blob([content], {type: type || "text/plain;charset=utf-8"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 100);
+}
+
+// Open a print-friendly window with the supplied HTML body and trigger the print dialog
+function openPrintWindow(title, bodyHtml){
+  const w = window.open("", "_blank", "width=900,height=1100");
+  if(!w){ alert("ポップアップがブロックされました。ブラウザ設定で許可してください。"); return; }
+  const style = `
+    @page { size: A4; margin: 18mm 16mm; }
+    body { font-family: "Noto Serif JP", "Hiragino Mincho ProN", "Yu Mincho", serif; color: #1a1612; font-size: 12pt; line-height: 1.7; -webkit-font-smoothing: antialiased; font-feature-settings: "palt"; }
+    .doc-title { font-size: 22pt; font-weight: 600; text-align: center; letter-spacing: 0.3em; padding-bottom: 14px; border-bottom: 2px solid #1a1612; margin-bottom: 28px; }
+    .doc-meta { display: flex; justify-content: space-between; margin-bottom: 24px; font-size: 11pt; }
+    .doc-section { margin-bottom: 22px; }
+    .doc-h { font-size: 13pt; font-weight: 600; border-left: 3px solid #9c3a30; padding-left: 8px; margin-bottom: 10px; }
+    .doc-row { display: flex; padding: 6px 0; border-bottom: 1px dotted #aaa; }
+    .doc-row .label { width: 35%; color: #555; }
+    .doc-row .value { width: 65%; font-weight: 500; }
+    table.doc { width: 100%; border-collapse: collapse; margin: 8px 0 14px; }
+    table.doc th, table.doc td { padding: 8px 10px; border-bottom: 1px solid #999; text-align: left; font-size: 11pt; }
+    table.doc th { background: #f0ebde; font-weight: 600; }
+    table.doc td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    table.doc tr.total td { font-weight: 700; border-top: 2px solid #1a1612; border-bottom: 2px solid #1a1612; background: #faf7ef; }
+    .doc-total-big { font-size: 18pt; font-weight: 700; text-align: right; padding: 14px 20px; background: #faf7ef; border: 2px solid #1a1612; margin: 12px 0; }
+    .doc-stamp { display: inline-block; width: 80px; height: 80px; border: 2px solid #9c3a30; border-radius: 50%; color: #9c3a30; font-size: 11pt; text-align: center; line-height: 1.3; padding-top: 22px; font-weight: 600; }
+    .doc-foot { margin-top: 36px; padding-top: 18px; border-top: 1px solid #999; font-size: 10pt; color: #555; }
+    .doc-from { text-align: right; margin-bottom: 24px; font-size: 11pt; line-height: 1.7; }
+    .print-btn { position: fixed; top: 10px; right: 10px; padding: 8px 16px; background: #9c3a30; color: white; border: none; font-size: 13px; cursor: pointer; border-radius: 2px; font-family: sans-serif; }
+    .close-note { position: fixed; top: 50px; right: 10px; padding: 6px 12px; background: #fff; color: #555; border: 1px solid #ccc; font-size: 11px; border-radius: 2px; font-family: sans-serif; }
+    @media print { .print-btn, .close-note { display: none; } body { margin: 0; } }
+  `;
+  w.document.write(`<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><title>${esc(title)}</title><style>${style}</style></head><body><button class="print-btn" onclick="window.print()">印刷する</button><div class="close-note">印刷後にウィンドウを閉じてください</div>${bodyHtml}</body></html>`);
+  w.document.close();
+  // Auto-trigger print after a moment for usability
+  setTimeout(() => { try { w.focus(); } catch{} }, 200);
+}
+
+// Escape HTML for safe embedding in print window
+function esc(s){ return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+// Build invoice document HTML (請求書)
+function buildInvoiceHtml(billing, data){
+  const contract = data.contract.find(c => c.id === billing.contractId);
+  const room = contract ? data.room.find(r => r.id === contract.roomId) : null;
+  const building = room ? data.building.find(b => b.id === room.buildingId) : null;
+  const settings = data.settings || {};
+  const today = new Date();
+  const tStr = `${today.getFullYear()}年${today.getMonth()+1}月${today.getDate()}日`;
+  const ymStr = `${billing.year}年${billing.month}月分`;
+  const otherRow = (Number(billing.otherAmount)||0) > 0 ? `<tr><td>${esc(billing.otherNote || "その他")}</td><td class="num">${fmtMoney(billing.otherAmount)}</td></tr>` : "";
+  return `
+    <div class="doc-title">請　求　書</div>
+    <div class="doc-meta">
+      <div>${esc(contract?.tenantName || "")} 様</div>
+      <div>発行日: ${tStr}</div>
+    </div>
+    <div class="doc-from">
+      ${esc(settings.companyName || "")}<br>
+      ${esc(settings.bankAccount || "")}
+    </div>
+    <div class="doc-section">
+      <div class="doc-h">請求対象</div>
+      <div class="doc-row"><div class="label">対象期間</div><div class="value">${ymStr}</div></div>
+      <div class="doc-row"><div class="label">物件</div><div class="value">${esc(building?.name || "")} ${esc(room?.roomNo || "")}号室</div></div>
+      <div class="doc-row"><div class="label">契約番号</div><div class="value">${esc(contract?.contractNo || "")}</div></div>
+      <div class="doc-row"><div class="label">支払期限</div><div class="value">${fmtDate(billing.dueDate)}</div></div>
+    </div>
+    <div class="doc-section">
+      <div class="doc-h">内訳</div>
+      <table class="doc">
+        <thead><tr><th>項目</th><th style="width:200px; text-align:right;">金額</th></tr></thead>
+        <tbody>
+          <tr><td>賃料</td><td class="num">${fmtMoney(billing.rentAmount)}</td></tr>
+          <tr><td>共益費</td><td class="num">${fmtMoney(billing.feeAmount)}</td></tr>
+          ${otherRow}
+          <tr class="total"><td>合計</td><td class="num">${fmtMoney(billing.totalAmount)}</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="doc-total-big">ご請求金額　${fmtMoney(billing.totalAmount)}</div>
+    ${billing.memo ? `<div class="doc-section"><div class="doc-h">備考</div><div>${esc(billing.memo)}</div></div>` : ""}
+    <div class="doc-foot">本書類は ${esc(settings.companyName || "")} が発行する請求書です。記載内容にご不明な点がございましたらお問い合わせください。</div>
+  `;
+}
+
+// Build receipt document HTML (領収書)
+function buildReceiptHtml(billing, data){
+  const contract = data.contract.find(c => c.id === billing.contractId);
+  const room = contract ? data.room.find(r => r.id === contract.roomId) : null;
+  const building = room ? data.building.find(b => b.id === room.buildingId) : null;
+  const payments = (data.payment||[]).filter(p => p.billingId === billing.id);
+  const settings = data.settings || {};
+  const today = new Date();
+  const tStr = `${today.getFullYear()}年${today.getMonth()+1}月${today.getDate()}日`;
+  const paymentRows = payments.map(p => `<tr><td>${fmtDate(p.paidDate)}</td><td>${esc(p.method||"")}</td><td class="num">${fmtMoney(p.amount)}</td></tr>`).join("");
+  return `
+    <div class="doc-title">領　収　書</div>
+    <div class="doc-meta">
+      <div>${esc(contract?.tenantName || "")} 様</div>
+      <div>発行日: ${tStr}</div>
+    </div>
+    <div class="doc-total-big">領収金額　${fmtMoney(billing.paidAmount)}</div>
+    <div class="doc-section">
+      <div class="doc-h">領収対象</div>
+      <div class="doc-row"><div class="label">対象期間</div><div class="value">${billing.year}年${billing.month}月分賃料等</div></div>
+      <div class="doc-row"><div class="label">物件</div><div class="value">${esc(building?.name || "")} ${esc(room?.roomNo || "")}号室</div></div>
+      <div class="doc-row"><div class="label">契約番号</div><div class="value">${esc(contract?.contractNo || "")}</div></div>
+      <div class="doc-row"><div class="label">請求合計</div><div class="value">${fmtMoney(billing.totalAmount)}</div></div>
+    </div>
+    ${payments.length > 0 ? `
+      <div class="doc-section">
+        <div class="doc-h">入金明細</div>
+        <table class="doc">
+          <thead><tr><th>入金日</th><th>方法</th><th style="text-align:right; width:160px;">金額</th></tr></thead>
+          <tbody>${paymentRows}<tr class="total"><td colspan="2">合計</td><td class="num">${fmtMoney(billing.paidAmount)}</td></tr></tbody>
+        </table>
+      </div>` : ""}
+    <div style="margin-top: 40px; display: flex; justify-content: flex-end; align-items: center; gap: 24px;">
+      <div style="text-align: right;">
+        ${esc(settings.companyName || "")}<br>
+        <span style="font-size: 10pt; color: #777;">${esc(settings.bankAccount || "")}</span>
+      </div>
+      <div class="doc-stamp">領収<br>印</div>
+    </div>
+    <div class="doc-foot">この領収書は上記金額を正に領収したことを証するものです。</div>
+  `;
+}
+
+// Build owner remittance statement HTML (家主送金明細書)
+function buildRemittanceHtml(remittance, data){
+  const owner = data.owner.find(o => o.id === remittance.ownerId);
+  const ownerBuildings = (data.building||[]).filter(b => b.ownerId === remittance.ownerId);
+  const ownerBldIds = ownerBuildings.map(b => b.id);
+  const ownerRoomIds = (data.room||[]).filter(r => ownerBldIds.includes(r.buildingId)).map(r => r.id);
+  const ownerContractIds = (data.contract||[]).filter(c => ownerRoomIds.includes(c.roomId)).map(c => c.id);
+  const monthBs = (data.billing||[]).filter(b => b.year === remittance.year && b.month === remittance.month && ownerContractIds.includes(b.contractId));
+  const monthStart = `${remittance.year}-${String(remittance.month).padStart(2,"0")}-01`;
+  const monthEnd = `${remittance.year}-${String(remittance.month).padStart(2,"0")}-31`;
+  const monthRepairs = (data.repair||[]).filter(rp => ownerBldIds.includes(rp.buildingId) && rp.paidBy === "家主負担" && rp.completionDate >= monthStart && rp.completionDate <= monthEnd);
+  const settings = data.settings || {};
+  const today = new Date();
+  const tStr = `${today.getFullYear()}年${today.getMonth()+1}月${today.getDate()}日`;
+  const billRows = monthBs.map(b => {
+    const c = data.contract.find(cc => cc.id === b.contractId);
+    const r = c ? data.room.find(rr => rr.id === c.roomId) : null;
+    const bld = r ? data.building.find(bb => bb.id === r.buildingId) : null;
+    return `<tr><td>${esc(bld?.name||"")} ${esc(r?.roomNo||"")}号室</td><td>${esc(c?.tenantName||"")}</td><td class="num">${fmtMoney(b.totalAmount)}</td><td class="num">${fmtMoney(b.paidAmount)}</td></tr>`;
+  }).join("");
+  const repairRows = monthRepairs.map(rp => {
+    const v = data.vendor.find(vv => vv.id === rp.vendorId);
+    const bld = data.building.find(bb => bb.id === rp.buildingId);
+    return `<tr><td>${fmtDate(rp.completionDate)}</td><td>${esc(bld?.name||"")}</td><td>${esc(v?.name||"")}</td><td>${esc(rp.workContent||"")}</td><td class="num">${fmtMoney(rp.cost)}</td></tr>`;
+  }).join("");
+  return `
+    <div class="doc-title">家主送金明細書</div>
+    <div class="doc-meta">
+      <div>${esc(owner?.name||"")} 様</div>
+      <div>発行日: ${tStr}　対象: ${remittance.year}年${remittance.month}月分</div>
+    </div>
+    <div class="doc-from">${esc(settings.companyName || "")}</div>
+    <div class="doc-section">
+      <div class="doc-h">入金明細</div>
+      <table class="doc">
+        <thead><tr><th>物件</th><th>契約者</th><th style="text-align:right; width:140px;">請求額</th><th style="text-align:right; width:140px;">入金額</th></tr></thead>
+        <tbody>${billRows || `<tr><td colspan="4" style="text-align:center; color:#888;">該当データなし</td></tr>`}
+          <tr class="total"><td colspan="3">入金合計</td><td class="num">${fmtMoney(remittance.totalRentReceived)}</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="doc-section">
+      <div class="doc-h">家主様負担工事費</div>
+      <table class="doc">
+        <thead><tr><th>完了日</th><th>建物</th><th>業者</th><th>内容</th><th style="text-align:right; width:120px;">金額</th></tr></thead>
+        <tbody>${repairRows || `<tr><td colspan="5" style="text-align:center; color:#888;">該当工事なし</td></tr>`}
+          <tr class="total"><td colspan="4">工事費合計</td><td class="num">${fmtMoney(remittance.repairs)}</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="doc-section">
+      <div class="doc-h">送金計算</div>
+      <table class="doc">
+        <tbody>
+          <tr><td>入金合計</td><td class="num">${fmtMoney(remittance.totalRentReceived)}</td></tr>
+          <tr><td>管理手数料（${remittance.managementFeeRate}%）</td><td class="num">− ${fmtMoney(remittance.managementFee)}</td></tr>
+          <tr><td>家主様負担工事費</td><td class="num">− ${fmtMoney(remittance.repairs)}</td></tr>
+          <tr class="total"><td>お振込み金額</td><td class="num">${fmtMoney(remittance.netAmount)}</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="doc-total-big">お振込み金額　${fmtMoney(remittance.netAmount)}</div>
+    <div class="doc-foot">本明細書の内容についてご不明な点がございましたら ${esc(settings.companyName || "")} までお問い合わせください。</div>
+  `;
+}
+const newId = (p) => `${p}_${Date.now().toString(36)}${Math.random().toString(36).slice(2,6)}`;
+
+const fmtMoney = (n) => { if(n===""||n==null||isNaN(Number(n))) return "—"; return "¥"+Number(n).toLocaleString("ja-JP"); };
+const fmtDate = (s) => { if(!s) return "—"; const d = new Date(s); if(isNaN(d)) return s; return `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,"0")}/${String(d.getDate()).padStart(2,"0")}`; };
+const fmtDateTime = (s) => { if(!s) return "—"; const d = new Date(s); if(isNaN(d)) return s; return `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,"0")}/${String(d.getDate()).padStart(2,"0")} ${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`; };
+const fmtYM = (y,m) => `${y}年${String(m).padStart(2,"0")}月`;
+const currentYM = () => { const d=new Date(); return {year:d.getFullYear(),month:d.getMonth()+1}; };
+
+/* ============================================================
+   Claude API クライアント
+   - "direct" mode: Anthropic API 直接 (x-api-key + dangerous-direct-browser-access)
+   - "gateway" mode: BMS API Gateway 経由 (Authorization: Bearer)
+   - エンドポイントとモードは settings から動的に切替可能
+   ============================================================ */
+async function callClaudeApi(prompt, settings) {
+  const endpoint = settings.aiEndpoint || "https://api.anthropic.com/v1/messages";
+  const model = settings.aiModel || "claude-sonnet-4-5";
+  const maxTokens = Number(settings.aiMaxTokens) || 4096;
+  const apiKey = settings.aiApiKey || "";
+  const authMode = settings.aiAuthMode || "direct";
+
+  if(!apiKey) throw new Error("APIキーが未設定です。設定ページで AI連携を有効化してください。");
+
+  const headers = {
+    "content-type": "application/json",
+    "anthropic-version": "2023-06-01",
+  };
+  if(authMode === "gateway") {
+    headers["authorization"] = `Bearer ${apiKey}`;
+  } else {
+    headers["x-api-key"] = apiKey;
+    headers["anthropic-dangerous-direct-browser-access"] = "true";
+  }
+
+  let response;
+  try {
+    response = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model,
+        max_tokens: maxTokens,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+  } catch(e) {
+    throw new Error(`ネットワークエラー: ${e.message}。エンドポイントURLとオンライン接続を確認してください。`);
+  }
+
+  if(!response.ok) {
+    let errMsg = `API エラー ${response.status}`;
+    try { const errBody = await response.json(); errMsg += `: ${errBody.error?.message || JSON.stringify(errBody)}`; }
+    catch { errMsg += `: ${await response.text()}`; }
+    throw new Error(errMsg);
+  }
+
+  const data = await response.json();
+  const text = (data.content || []).filter(c => c.type === "text").map(c => c.text).join("\n");
+  return {
+    text,
+    model: data.model || model,
+    usage: data.usage || {},
+    stopReason: data.stop_reason,
+    raw: data,
+  };
+}
+
+/* ============================================================
+   軽量 Markdown レンダラ (AI出力表示用)
+   - サポート: # ## ### 見出し / **bold** / - 箇条書き / 1. 番号付き / 空行
+   - dangerouslySetInnerHTML は使わない (XSS安全)
+   ============================================================ */
+function renderMarkdown(text) {
+  if(!text) return null;
+  const lines = String(text).split("\n");
+  const out = [];
+  const renderInline = (s) => {
+    const parts = String(s).split(/(\*\*[^*]+\*\*)/g);
+    return parts.map((p, i) => {
+      if(p.startsWith("**") && p.endsWith("**")) return React.createElement("strong", {key: i}, p.slice(2, -2));
+      return p;
+    });
+  };
+  lines.forEach((line, i) => {
+    if(/^### /.test(line)) { out.push(React.createElement("div", {key:i, style:{fontWeight:700, fontSize:13, marginTop:10, marginBottom:4, color:"var(--ink)"}}, line.replace(/^### /, ""))); return; }
+    if(/^## /.test(line)) { out.push(React.createElement("div", {key:i, style:{fontWeight:800, fontSize:15, marginTop:14, marginBottom:6, color:"var(--ink)", paddingBottom:4, borderBottom:"1px solid var(--border)"}}, line.replace(/^## /, ""))); return; }
+    if(/^# /.test(line)) { out.push(React.createElement("div", {key:i, style:{fontWeight:800, fontSize:17, marginTop:16, marginBottom:8, color:"var(--ink)"}}, line.replace(/^# /, ""))); return; }
+    if(/^[-*] /.test(line)) { out.push(React.createElement("div", {key:i, style:{display:"flex", gap:8, paddingLeft:4, marginBottom:3}}, React.createElement("span", {style:{color:"var(--accent)", fontWeight:700}}, "•"), React.createElement("span", {style:{flex:1}}, renderInline(line.replace(/^[-*] /, ""))))); return; }
+    if(/^\d+\.\s/.test(line)) { const m=line.match(/^(\d+)\.\s(.*)/); out.push(React.createElement("div", {key:i, style:{display:"flex", gap:8, paddingLeft:4, marginBottom:3}}, React.createElement("span", {style:{color:"var(--accent)", fontWeight:700, minWidth:18}}, m[1]+"."), React.createElement("span", {style:{flex:1}}, renderInline(m[2])))); return; }
+    if(!line.trim()) { out.push(React.createElement("div", {key:i, style:{height:8}})); return; }
+    out.push(React.createElement("div", {key:i, style:{marginBottom:3, lineHeight:1.75}}, renderInline(line)));
+  });
+  return out;
+}
+
+/* ============================================================
+   全エンティティ統計サマリ生成
+   - 全データから業務上有用な集計を作る (AI への文脈提供)
+   - AIはこれを読んでクロスエンティティの相関を発見する
+   ============================================================ */
+function buildCrossEntityStats(data) {
+  const L = [];
+  const fmtY = (n) => `¥${Number(n||0).toLocaleString("ja-JP")}`;
+  const owners = data.owner || [];
+  const buildings = data.building || [];
+  const rooms = data.room || [];
+  const tenants = data.tenant || [];
+  const vendors = data.vendor || [];
+  const applications = data.application || [];
+  const contracts = data.contract || [];
+  const billings = data.billing || [];
+  const payments = data.payment || [];
+  const remittances = data.remittance || [];
+  const vendorPayments = data.vendorPayment || [];
+  const tickets = data.ticket || [];
+  const repairs = data.repair || [];
+  const constructions = data.construction || [];
+
+  // --- 家主 ---
+  if(owners.length > 0) {
+    const personal = owners.filter(o => o.type === "個人").length;
+    const corporate = owners.filter(o => o.type === "法人").length;
+    L.push(`### 家主`);
+    L.push(`- 総数: ${owners.length}名 (個人 ${personal} / 法人 ${corporate})`);
+    // 家主別物件数
+    const bldByOwner = {};
+    buildings.forEach(b => { bldByOwner[b.ownerId] = (bldByOwner[b.ownerId]||0)+1; });
+    const topOwners = owners.map(o => ({name:o.name, count: bldByOwner[o.id]||0})).sort((a,b)=>b.count-a.count).slice(0,3).filter(o => o.count > 0);
+    if(topOwners.length > 0) L.push(`- 物件数Top3: ${topOwners.map(o => `${o.name} ${o.count}棟`).join(" / ")}`);
+  }
+
+  // --- 建物・部屋 ---
+  if(buildings.length > 0 || rooms.length > 0) {
+    L.push(`### 建物・部屋`);
+    L.push(`- 建物: ${buildings.length}棟 / 部屋: ${rooms.length}室`);
+    if(rooms.length > 0) {
+      const occupied = rooms.filter(r => r.status === "入居中").length;
+      const vacant = rooms.filter(r => r.status === "空室").length;
+      const listed = rooms.filter(r => r.status === "募集中").length;
+      const occupancyRate = ((occupied/rooms.length)*100).toFixed(1);
+      L.push(`- 入居中: ${occupied} / 空室: ${vacant} / 募集中: ${listed} (入居率 ${occupancyRate}%)`);
+    }
+    // 建物別の空室率ワースト (10室以上のもの)
+    const occByBld = {};
+    rooms.forEach(r => {
+      if(!occByBld[r.buildingId]) occByBld[r.buildingId] = {total:0, vacant:0};
+      occByBld[r.buildingId].total++;
+      if(r.status === "空室" || r.status === "募集中") occByBld[r.buildingId].vacant++;
+    });
+    const worstBld = Object.entries(occByBld).filter(([_,v]) => v.total >= 5).map(([id, v]) => {
+      const b = buildings.find(x => x.id === id);
+      return { name: b?.name||"?", total: v.total, vacant: v.vacant, rate: v.vacant/v.total };
+    }).sort((a,b) => b.rate-a.rate).slice(0,3).filter(x => x.rate > 0);
+    if(worstBld.length > 0) L.push(`- 空室率Worst3: ${worstBld.map(b => `${b.name} (${b.vacant}/${b.total} = ${(b.rate*100).toFixed(0)}%)`).join(" / ")}`);
+  }
+
+  // --- 契約 ---
+  if(contracts.length > 0) {
+    L.push(`### 契約`);
+    const active = contracts.filter(c => c.status === "契約中").length;
+    const pendingCancel = contracts.filter(c => c.status === "解約予定").length;
+    L.push(`- 現契約: ${active}件 / 解約予定: ${pendingCancel}件`);
+    // 直近3ヶ月で契約終了予定
+    const now = new Date();
+    const in3M = new Date(now.getFullYear(), now.getMonth()+3, now.getDate()).toISOString().slice(0,10);
+    const nowStr = now.toISOString().slice(0,10);
+    const endingSoon = contracts.filter(c => c.status === "契約中" && c.endDate && c.endDate >= nowStr && c.endDate <= in3M).length;
+    if(endingSoon > 0) L.push(`- 3ヶ月以内に契約満了予定: ${endingSoon}件 (更新交渉対象)`);
+  }
+
+  // --- 申込 ---
+  if(applications.length > 0) {
+    L.push(`### 申込`);
+    const inProgress = applications.filter(a => a.status === "申込中" || a.status === "審査中").length;
+    const approved = applications.filter(a => a.status === "承認").length;
+    const rejected = applications.filter(a => a.status === "否認").length;
+    const total = approved+rejected;
+    L.push(`- 進行中: ${inProgress}件 / 承認累計: ${approved}件 / 否認累計: ${rejected}件`);
+    if(total > 0) L.push(`- 承認率: ${((approved/total)*100).toFixed(1)}%`);
+  }
+
+  // --- 業者 ---
+  if(vendors.length > 0) {
+    L.push(`### 業者`);
+    L.push(`- 取引業者: ${vendors.length}社`);
+    // 業者別支払累計Top5
+    const totalByVendor = {};
+    vendorPayments.filter(v => v.status === "支払済").forEach(v => {
+      totalByVendor[v.vendorId] = (totalByVendor[v.vendorId]||0) + (Number(v.amount)||0);
+    });
+    const topVendors = Object.entries(totalByVendor).map(([id, amt]) => ({
+      name: vendors.find(v => v.id === id)?.name || "不明", amount: amt
+    })).sort((a,b)=>b.amount-a.amount).slice(0,5).filter(v => v.amount > 0);
+    if(topVendors.length > 0) {
+      L.push(`- 累計支払額Top5:`);
+      topVendors.forEach(v => L.push(`  - ${v.name}: ${fmtY(v.amount)}`));
+      const total = Object.values(totalByVendor).reduce((s,v)=>s+v,0);
+      const top2 = topVendors.slice(0,2).reduce((s,v)=>s+v.amount,0);
+      if(total > 0) L.push(`- 上位2社集中度: ${((top2/total)*100).toFixed(1)}% (リスク分散の観点)`);
+    }
+  }
+
+  // --- 入金状況 ---
+  if(billings.length > 0) {
+    const totalBilled = billings.reduce((s,b)=>s+(Number(b.totalAmount)||0), 0);
+    const totalPaid = billings.reduce((s,b)=>s+(Number(b.paidAmount)||0), 0);
+    const collRate = totalBilled > 0 ? ((totalPaid/totalBilled)*100).toFixed(1) : 0;
+    const overdue = billings.filter(b => b.status === "未収" || b.status === "一部入金").length;
+    L.push(`### 入金状況`);
+    L.push(`- 累計請求額: ${fmtY(totalBilled)} / 累計入金額: ${fmtY(totalPaid)} (収納率 ${collRate}%)`);
+    if(overdue > 0) L.push(`- 未収・一部入金: ${overdue}件`);
+  }
+
+  // --- チケット・修繕 ---
+  if(tickets.length > 0 || repairs.length > 0) {
+    L.push(`### 問い合わせ・修繕`);
+    const openTickets = tickets.filter(t => t.status !== "完了").length;
+    L.push(`- チケット: ${tickets.length}件 (未完了 ${openTickets}件)`);
+    // カテゴリ別
+    const catCounts = {};
+    tickets.forEach(t => { catCounts[t.category||"その他"] = (catCounts[t.category||"その他"]||0)+1; });
+    const catTop = Object.entries(catCounts).sort((a,b)=>b[1]-a[1]).slice(0,3);
+    if(catTop.length > 0) L.push(`- カテゴリ別: ${catTop.map(c => `${c[0]} ${c[1]}件`).join(" / ")}`);
+    // 修繕費負担別
+    if(repairs.length > 0) {
+      const ownerBurden = repairs.filter(r => r.paidBy === "家主負担").reduce((s,r)=>s+(Number(r.cost)||0),0);
+      const tenantBurden = repairs.filter(r => r.paidBy === "借主負担").reduce((s,r)=>s+(Number(r.cost)||0),0);
+      const mgmtBurden = repairs.filter(r => r.paidBy === "管理会社負担").reduce((s,r)=>s+(Number(r.cost)||0),0);
+      L.push(`- 修繕累計費用: 家主負担 ${fmtY(ownerBurden)} / 借主負担 ${fmtY(tenantBurden)} / 管理会社負担 ${fmtY(mgmtBurden)}`);
+    }
+  }
+
+  // --- 工事案件 (登録があれば) ---
+  if(constructions.length > 0) {
+    L.push(`### 工事案件`);
+    const active = constructions.filter(c => ["受注","施工中","完了"].includes(c.status)).length;
+    const totalContract = constructions.reduce((s,c)=>s+(Number(c.contractAmount)||0), 0);
+    const totalPaid = constructions.reduce((s,c)=>s+(Number(c.paidAmount)||0), 0);
+    const totalSubcontractor = constructions.reduce((s,c)=>s+(Number(c.subcontractorCost)||0), 0);
+    L.push(`- 案件数: ${constructions.length}件 (アクティブ ${active}件)`);
+    L.push(`- 受注額累計: ${fmtY(totalContract)} / 入金累計: ${fmtY(totalPaid)} / 外注費累計: ${fmtY(totalSubcontractor)}`);
+    // カテゴリ別
+    const catC = {};
+    constructions.forEach(c => { catC[c.category||"その他"] = (catC[c.category||"その他"]||0)+1; });
+    const catTop = Object.entries(catC).sort((a,b)=>b[1]-a[1]);
+    if(catTop.length > 0) L.push(`- 区分別: ${catTop.map(c => `${c[0]} ${c[1]}件`).join(" / ")}`);
+  }
+
+  return L.join("\n");
+}
+
+/* ============================================================
+   学習用: 過去の人間レビュー済み分析をコンテキストとして抽出
+   - 評価が4以上 または 訂正があるもの優先
+   - 直近6件まで
+   ============================================================ */
+function buildLearningContext(aiAnalyses) {
+  const reviewed = (aiAnalyses||[])
+    .filter(a => a.reviewStatus === "reviewed" && (a.rating >= 3 || a.corrections || a.reviewerComment))
+    .sort((a,b) => (b.createdAt||"").localeCompare(a.createdAt||""))
+    .slice(0, 6);
+  if(reviewed.length === 0) return "";
+  const L = [];
+  L.push(`## 過去の分析履歴と人間によるフィードバック (これらを踏まえて精度を上げてください)`);
+  reviewed.forEach((a, i) => {
+    L.push(``);
+    L.push(`### 過去分析 #${i+1} — ${a.periodYear}年${a.periodMonth}月分 (${a.createdAt?.slice(0,10)||""})`);
+    L.push(`- ユーザー評価: ★${a.rating || "-"}/5`);
+    if(a.reviewerComment) L.push(`- ユーザーコメント: ${a.reviewerComment}`);
+    if(a.corrections) L.push(`- ユーザーによる訂正: ${a.corrections}`);
+    // レスポンスは長いので要約: 最初の300文字
+    if(a.response) {
+      const summary = String(a.response).replace(/\s+/g, " ").slice(0, 300);
+      L.push(`- その時のAI分析(冒頭): ${summary}${a.response.length > 300 ? "…" : ""}`);
+    }
+  });
+  L.push(``);
+  L.push(`上記の過去分析と訂正履歴を参考に、今回はより正確で実用的な分析を行ってください。`);
+  L.push(`特に過去にユーザーが訂正したポイントについては同じ間違いを繰り返さないよう注意してください。`);
+  return L.join("\n");
+}
+const toYM = (y,m) => `${y}-${String(m).padStart(2,"0")}`;
+// Local-time YYYY-MM-DD (タイムゾーン安全: toISOString().slice(0,10)はUTCで1日ズレるため使わない)
+const _pad = (n) => String(n).padStart(2,"0");
+const dateToYMD = (d) => `${d.getFullYear()}-${_pad(d.getMonth()+1)}-${_pad(d.getDate())}`;
+const todayLocal = () => dateToYMD(new Date());
+
+/* ====== Master entity configs ====== */
+const ENTITIES = {
+  owner: {
+    key:"owner", label:"家主", glyph:"主", idPrefix:"own",
+    listColumns:["name","kana","type","tel"], primaryKey:"name", secondaryKey:"kana",
+    sections:[
+      {title:"基本情報", fields:[
+        {key:"name", label:"氏名 / 法人名", type:"text", required:true, full:true},
+        {key:"kana", label:"フリガナ", type:"text"},
+        {key:"type", label:"区分", type:"select", options:["個人","法人"], default:"個人"},
+        {key:"zip", label:"郵便番号", type:"text", placeholder:"123-4567"},
+        {key:"address", label:"住所", type:"text", full:true},
+        {key:"tel", label:"電話番号", type:"tel"},
+        {key:"fax", label:"FAX", type:"tel"},
+        {key:"email", label:"メール", type:"email", full:true},
+      ]},
+      {title:"送金先口座", fields:[
+        {key:"bank", label:"銀行名", type:"text"},
+        {key:"branch", label:"支店名", type:"text"},
+        {key:"accountType", label:"口座種別", type:"select", options:["普通","当座"], default:"普通"},
+        {key:"accountNo", label:"口座番号", type:"text"},
+        {key:"accountName", label:"口座名義（カナ）", type:"text", full:true},
+      ]},
+      {title:"その他", fields:[{key:"memo", label:"備考", type:"textarea", full:true}]}
+    ]
+  },
+  building: {
+    key:"building", label:"建物", glyph:"棟", idPrefix:"bld",
+    listColumns:["name","ownerId","address","rooms"], primaryKey:"name", secondaryKey:"kana",
+    sections:[
+      {title:"建物情報", fields:[
+        {key:"name", label:"建物名", type:"text", required:true, full:true},
+        {key:"kana", label:"フリガナ", type:"text"},
+        {key:"ownerId", label:"家主", type:"ref", refEntity:"owner", required:true},
+        {key:"zip", label:"郵便番号", type:"text"},
+        {key:"address", label:"所在地", type:"text", full:true},
+        {key:"structure", label:"構造", type:"select", options:["木造","鉄骨","RC","SRC","軽量鉄骨","その他"], default:"RC"},
+        {key:"floors", label:"階数", type:"number"},
+        {key:"totalUnits", label:"総戸数", type:"number"},
+        {key:"builtYear", label:"築年（西暦）", type:"number"},
+        {key:"builtMonth", label:"築月", type:"number"},
+        {key:"parking", label:"駐車場", type:"select", options:["なし","あり","近隣"], default:"なし"},
+      ]},
+      {title:"その他", fields:[{key:"memo", label:"備考", type:"textarea", full:true}]}
+    ]
+  },
+  room: {
+    key:"room", label:"部屋", glyph:"室", idPrefix:"rm",
+    listColumns:["buildingId","roomNo","layout","rent","status"], primaryKey:"roomNo", secondaryKey:"layout",
+    sections:[
+      {title:"部屋情報", fields:[
+        {key:"buildingId", label:"建物", type:"ref", refEntity:"building", required:true, full:true},
+        {key:"roomNo", label:"部屋番号", type:"text", required:true, placeholder:"101"},
+        {key:"floor", label:"階", type:"number"},
+        {key:"layout", label:"間取り", type:"select", options:["1R","1K","1DK","1LDK","2K","2DK","2LDK","3DK","3LDK","4LDK","その他"], default:"1K"},
+        {key:"area", label:"専有面積 (㎡)", type:"number"},
+        {key:"direction", label:"向き", type:"select", options:["北","東","南","西","北東","北西","南東","南西","-"], default:"-"},
+        {key:"status", label:"状態", type:"select", options:["入居中","空室","募集中"], default:"空室"},
+      ]},
+      {title:"賃料・初期費用", fields:[
+        {key:"rent", label:"賃料 (円/月)", type:"money"},
+        {key:"fee", label:"共益費 (円/月)", type:"money"},
+        {key:"deposit", label:"敷金 (円)", type:"money"},
+        {key:"keyMoney", label:"礼金 (円)", type:"money"},
+      ]},
+      {title:"その他", fields:[
+        {key:"facilities", label:"設備", type:"textarea", full:true},
+        {key:"memo", label:"備考", type:"textarea", full:true},
+      ]}
+    ]
+  },
+  tenant: {
+    key:"tenant", label:"契約者", glyph:"入", idPrefix:"tnt",
+    listColumns:["name","roomId","contractStart","contractEnd","tel"], primaryKey:"name", secondaryKey:"kana",
+    sections:[
+      {title:"契約者情報", fields:[
+        {key:"name", label:"氏名", type:"text", required:true},
+        {key:"kana", label:"フリガナ", type:"text"},
+        {key:"birthday", label:"生年月日", type:"date"},
+        {key:"tel", label:"電話番号", type:"tel"},
+        {key:"email", label:"メール", type:"email", full:true},
+        {key:"occupation", label:"勤務先", type:"text", full:true},
+      ]},
+      {title:"契約情報", fields:[
+        {key:"roomId", label:"入居部屋", type:"ref", refEntity:"room", required:true, full:true},
+        {key:"contractStart", label:"契約開始日", type:"date"},
+        {key:"contractEnd", label:"契約終了日", type:"date"},
+        {key:"rent", label:"賃料 (円/月)", type:"money"},
+        {key:"guarantor", label:"保証会社", type:"text", full:true},
+      ]},
+      {title:"緊急連絡先", fields:[
+        {key:"emergencyName", label:"氏名", type:"text"},
+        {key:"emergencyRelation", label:"続柄", type:"text"},
+        {key:"emergencyTel", label:"電話番号", type:"tel"},
+      ]},
+      {title:"その他", fields:[{key:"memo", label:"備考", type:"textarea", full:true}]}
+    ]
+  },
+  vendor: {
+    key:"vendor", label:"取引業者", glyph:"業", idPrefix:"vnd",
+    listColumns:["name","category","person","tel"], primaryKey:"name", secondaryKey:"kana",
+    sections:[
+      {title:"業者情報", fields:[
+        {key:"name", label:"業者名", type:"text", required:true, full:true},
+        {key:"kana", label:"フリガナ", type:"text"},
+        {key:"category", label:"業種", type:"select", options:["清掃","修繕","水道工事","電気工事","ガス工事","鍵交換","リフォーム","外構","害虫駆除","その他"], default:"修繕"},
+        {key:"person", label:"担当者", type:"text"},
+        {key:"tel", label:"電話番号", type:"tel"},
+        {key:"fax", label:"FAX", type:"tel"},
+        {key:"email", label:"メール", type:"email", full:true},
+        {key:"zip", label:"郵便番号", type:"text"},
+        {key:"address", label:"住所", type:"text", full:true},
+      ]},
+      {title:"その他", fields:[{key:"memo", label:"備考", type:"textarea", full:true}]}
+    ]
+  }
+};
+
+/* ====== Operational entity configs ====== */
+const OPS = {
+  application: {
+    key:"application", label:"申込", glyph:"申", idPrefix:"app",
+    listColumns:["applicationDate","applicantName","roomId","moveInWish","status"],
+    primaryKey:"applicantName", secondaryKey:"applicantKana",
+    statuses:["申込中","審査中","承認","否認"],
+    sections:[
+      {title:"申込者情報", fields:[
+        {key:"applicantName", label:"氏名", type:"text", required:true},
+        {key:"applicantKana", label:"フリガナ", type:"text"},
+        {key:"birthday", label:"生年月日", type:"date"},
+        {key:"applicantTel", label:"電話番号", type:"tel"},
+        {key:"applicantEmail", label:"メール", type:"email", full:true},
+        {key:"occupation", label:"勤務先", type:"text"},
+        {key:"annualIncome", label:"年収 (円)", type:"money"},
+      ]},
+      {title:"申込内容", fields:[
+        {key:"roomId", label:"希望部屋", type:"ref", refEntity:"room", required:true, full:true},
+        {key:"applicationDate", label:"申込日", type:"date", required:true},
+        {key:"moveInWish", label:"入居希望日", type:"date"},
+        {key:"status", label:"ステータス", type:"select", options:["申込中","審査中","承認","否認"], default:"申込中"},
+      ]},
+      {title:"緊急連絡先", fields:[
+        {key:"emergencyName", label:"氏名", type:"text"},
+        {key:"emergencyRelation", label:"続柄", type:"text"},
+        {key:"emergencyTel", label:"電話番号", type:"tel"},
+      ]},
+      {title:"その他", fields:[{key:"memo", label:"備考", type:"textarea", full:true}]}
+    ]
+  },
+  contract: {
+    key:"contract", label:"契約", glyph:"契", idPrefix:"ct",
+    listColumns:["contractNo","tenantName","roomId","startDate","endDate","status"],
+    primaryKey:"contractNo", secondaryKey:"tenantName",
+    statuses:["契約中","解約予定","解約済"],
+    sections:[
+      {title:"契約情報", fields:[
+        {key:"contractNo", label:"契約番号", type:"text", required:true},
+        {key:"contractType", label:"契約区分", type:"select", options:["新規","更新"], default:"新規"},
+        {key:"tenantName", label:"契約者氏名", type:"text", required:true},
+        {key:"tenantKana", label:"フリガナ", type:"text"},
+        {key:"roomId", label:"対象部屋", type:"ref", refEntity:"room", required:true, full:true},
+        {key:"contractDate", label:"契約締結日", type:"date"},
+        {key:"startDate", label:"契約開始日", type:"date", required:true},
+        {key:"endDate", label:"契約終了日", type:"date", required:true},
+        {key:"status", label:"ステータス", type:"select", options:["契約中","解約予定","解約済"], default:"契約中"},
+      ]},
+      {title:"賃料・諸費用", fields:[
+        {key:"rent", label:"賃料 (円/月)", type:"money", required:true},
+        {key:"fee", label:"共益費 (円/月)", type:"money"},
+        {key:"deposit", label:"敷金 (円)", type:"money"},
+        {key:"keyMoney", label:"礼金 (円)", type:"money"},
+        {key:"renewalFee", label:"更新料 (円)", type:"money"},
+      ]},
+      {title:"保証", fields:[
+        {key:"guarantor", label:"保証会社", type:"text"},
+        {key:"guarantorContact", label:"保証会社連絡先", type:"text"},
+        {key:"cosigner", label:"連帯保証人氏名", type:"text"},
+        {key:"cosignerTel", label:"連帯保証人電話", type:"tel"},
+      ]},
+      {title:"その他", fields:[{key:"memo", label:"備考", type:"textarea", full:true}]}
+    ]
+  },
+  vendorPayment: {
+    key:"vendorPayment", label:"業者支払", glyph:"払", idPrefix:"vpay",
+    listColumns:["paymentDate","vendorId","purpose","amount","status"],
+    primaryKey:"purpose", secondaryKey:null,
+    statuses:["予定","支払済"],
+    sections:[
+      {title:"支払情報", fields:[
+        {key:"vendorId", label:"支払先業者", type:"ref", refEntity:"vendor", required:true, full:true},
+        {key:"paymentDate", label:"支払予定日", type:"date", required:true},
+        {key:"purpose", label:"用途・摘要", type:"text", required:true, full:true},
+        {key:"amount", label:"金額 (円)", type:"money", required:true},
+        {key:"method", label:"支払方法", type:"select", options:["振込","現金","口座引落","その他"], default:"振込"},
+        {key:"status", label:"状態", type:"select", options:["予定","支払済"], default:"予定"},
+        {key:"paidDate", label:"支払実施日", type:"date"},
+        {key:"buildingId", label:"対象建物", type:"ref", refEntity:"building"},
+      ]},
+      {title:"その他", fields:[{key:"memo", label:"備考", type:"textarea", full:true}]}
+    ]
+  },
+  ticket: {
+    key:"ticket", label:"問い合わせ", glyph:"問", idPrefix:"tk",
+    listColumns:["inquiryDate","ticketNo","inquirerName","category","priority","status"],
+    primaryKey:"ticketNo", secondaryKey:"inquirerName",
+    statuses:["受付","対応中","業者手配","完了"],
+    sections:[
+      {title:"問い合わせ", fields:[
+        {key:"ticketNo", label:"チケット番号", type:"text", required:true},
+        {key:"inquiryDate", label:"受付日", type:"date", required:true},
+        {key:"category", label:"カテゴリ", type:"select", options:["設備不具合","クレーム","問い合わせ","申請","その他"], default:"設備不具合"},
+        {key:"priority", label:"優先度", type:"select", options:["高","中","低"], default:"中"},
+        {key:"status", label:"ステータス", type:"select", options:["受付","対応中","業者手配","完了"], default:"受付"},
+        {key:"assignee", label:"担当者", type:"text"},
+      ]},
+      {title:"問い合わせ元", fields:[
+        {key:"inquirerName", label:"氏名", type:"text", required:true},
+        {key:"inquirerTel", label:"電話番号", type:"tel"},
+        {key:"inquirerEmail", label:"メール", type:"email"},
+        {key:"roomId", label:"関連部屋", type:"ref", refEntity:"room", full:true},
+      ]},
+      {title:"内容", fields:[
+        {key:"content", label:"内容", type:"textarea", full:true, required:true},
+        {key:"response", label:"対応内容", type:"textarea", full:true},
+      ]}
+    ]
+  },
+  repair: {
+    key:"repair", label:"修繕", glyph:"繕", idPrefix:"rp",
+    listColumns:["scheduledDate","buildingId","vendorId","workContent","cost","status"],
+    primaryKey:"workContent", secondaryKey:null,
+    statuses:["予定","実施中","完了"],
+    sections:[
+      {title:"修繕情報", fields:[
+        {key:"ticketId", label:"関連チケット", type:"ref", refEntity:"ticket"},
+        {key:"buildingId", label:"対象建物", type:"ref", refEntity:"building", required:true},
+        {key:"roomId", label:"対象部屋", type:"ref", refEntity:"room"},
+        {key:"vendorId", label:"施工業者", type:"ref", refEntity:"vendor", required:true},
+        {key:"scheduledDate", label:"予定日", type:"date", required:true},
+        {key:"completionDate", label:"完了日", type:"date"},
+        {key:"status", label:"状態", type:"select", options:["予定","実施中","完了"], default:"予定"},
+      ]},
+      {title:"工事内容・費用", fields:[
+        {key:"workContent", label:"工事内容", type:"text", required:true, full:true},
+        {key:"cost", label:"費用 (円)", type:"money"},
+        {key:"paidBy", label:"費用負担", type:"select", options:["家主負担","借主負担","管理会社負担"], default:"家主負担"},
+      ]},
+      {title:"その他", fields:[{key:"memo", label:"備考", type:"textarea", full:true}]}
+    ]
+  },
+  construction: {
+    key:"construction", label:"工事案件", glyph:"工", idPrefix:"cn",
+    listColumns:["projectNo","name","category","contractAmount","status"],
+    primaryKey:"name", secondaryKey:"projectNo",
+    statuses:["見積","受注","施工中","完了","入金済","キャンセル"],
+    sections:[
+      {title:"案件情報", fields:[
+        {key:"projectNo", label:"案件番号", type:"text", required:true},
+        {key:"name", label:"件名", type:"text", required:true, full:true},
+        {key:"category", label:"区分", type:"select", options:["大規模修繕","設備更新","内装工事","外構工事","新築管理","その他"], default:"大規模修繕"},
+        {key:"buildingId", label:"関連物件", type:"ref", refEntity:"building", full:true},
+        {key:"ownerId", label:"発注者(家主)", type:"ref", refEntity:"owner"},
+        {key:"clientName", label:"外部発注者名(家主以外)", type:"text"},
+        {key:"mainVendorId", label:"元請業者", type:"ref", refEntity:"vendor"},
+        {key:"assignee", label:"担当者", type:"text"},
+        {key:"status", label:"ステータス", type:"select", options:["見積","受注","施工中","完了","入金済","キャンセル"], default:"見積"},
+      ]},
+      {title:"スケジュール", fields:[
+        {key:"contractDate", label:"契約日", type:"date"},
+        {key:"startDate", label:"着工日", type:"date"},
+        {key:"endDate", label:"完了予定日", type:"date"},
+        {key:"completionDate", label:"実完了日", type:"date"},
+      ]},
+      {title:"金額", fields:[
+        {key:"contractAmount", label:"受注額 (円)", type:"money", required:true},
+        {key:"billedAmount", label:"請求済額 (円)", type:"money"},
+        {key:"paidAmount", label:"入金済額 (円)", type:"money"},
+        {key:"paymentDate", label:"最終入金日", type:"date"},
+        {key:"subcontractorCost", label:"外注費合計 (円)", type:"money"},
+        {key:"subcontractorPaidDate", label:"外注費最終支払日", type:"date"},
+      ]},
+      {title:"その他", fields:[{key:"memo", label:"備考", type:"textarea", full:true}]}
+    ]
+  }
+};
+
+const ENTITY_ORDER = ["owner","building","room","tenant","vendor"];
+const OPS_ORDER = Object.keys(OPS);
+
+const refLabel = (data, entityKey, id) => {
+  if(!id) return "—";
+  const item = (data[entityKey]||[]).find(x => x.id === id);
+  if(!item) return "（削除済）";
+  if(entityKey === "room") return `${refLabel(data,"building",item.buildingId)} ${item.roomNo}号室`;
+  if(entityKey === "ticket") return item.ticketNo || "（無番）";
+  if(entityKey === "contract") return item.contractNo || "（無番）";
+  const cfg = ENTITIES[entityKey] || OPS[entityKey];
+  return item[cfg.primaryKey] || "（無名）";
+};
+
+// 削除時の依存レコード集計：参照されている関連レコードを警告
+const countDependents = (data, entityKey, id) => {
+  const deps = {};
+  if(entityKey === "owner") {
+    const bldgs = (data.building||[]).filter(b => b.ownerId === id);
+    if(bldgs.length) deps["建物"] = bldgs.length;
+    const bldgIds = bldgs.map(b => b.id);
+    const rms = (data.room||[]).filter(r => bldgIds.includes(r.buildingId));
+    if(rms.length) deps["部屋"] = rms.length;
+    const rmt = (data.remittance||[]).filter(r => r.ownerId === id);
+    if(rmt.length) deps["送金記録"] = rmt.length;
+  } else if(entityKey === "building") {
+    const rms = (data.room||[]).filter(r => r.buildingId === id);
+    if(rms.length) deps["部屋"] = rms.length;
+    const rmIds = rms.map(r => r.id);
+    const ts = (data.tenant||[]).filter(t => rmIds.includes(t.roomId));
+    if(ts.length) deps["契約者"] = ts.length;
+    const cs = (data.contract||[]).filter(c => rmIds.includes(c.roomId));
+    if(cs.length) deps["契約"] = cs.length;
+    const vps = (data.vendorPayment||[]).filter(v => v.buildingId === id);
+    if(vps.length) deps["業者支払"] = vps.length;
+    const rps = (data.repair||[]).filter(r => r.buildingId === id);
+    if(rps.length) deps["修繕"] = rps.length;
+  } else if(entityKey === "room") {
+    const ts = (data.tenant||[]).filter(t => t.roomId === id);
+    if(ts.length) deps["契約者"] = ts.length;
+    const cs = (data.contract||[]).filter(c => c.roomId === id);
+    if(cs.length) deps["契約"] = cs.length;
+    const apps = (data.application||[]).filter(a => a.roomId === id);
+    if(apps.length) deps["申込"] = apps.length;
+    const tks = (data.ticket||[]).filter(t => t.roomId === id);
+    if(tks.length) deps["問い合わせ"] = tks.length;
+  } else if(entityKey === "contract") {
+    const bs = (data.billing||[]).filter(b => b.contractId === id);
+    if(bs.length) deps["請求"] = bs.length;
+    const paidB = bs.filter(b => (Number(b.paidAmount)||0) > 0).length;
+    if(paidB) deps["うち入金あり"] = paidB;
+  } else if(entityKey === "vendor") {
+    const rps = (data.repair||[]).filter(r => r.vendorId === id);
+    if(rps.length) deps["修繕"] = rps.length;
+    const vps = (data.vendorPayment||[]).filter(v => v.vendorId === id);
+    if(vps.length) deps["業者支払"] = vps.length;
+  } else if(entityKey === "ticket") {
+    const rps = (data.repair||[]).filter(r => r.ticketId === id);
+    if(rps.length) deps["修繕"] = rps.length;
+  } else if(entityKey === "application") {
+    const cs = (data.contract||[]).filter(c => c.applicationId === id);
+    if(cs.length) deps["契約"] = cs.length;
+  }
+  return deps;
+};
+
+const buildDeleteMessage = (data, confirmDelete) => {
+  const deps = countDependents(data, confirmDelete.entity, confirmDelete.id);
+  const depKeys = Object.keys(deps);
+  let msg = `「${confirmDelete.label}」を削除します。この操作は元に戻せません。`;
+  if(depKeys.length > 0) {
+    const list = depKeys.map(k => `${k} ${deps[k]}件`).join("、 ");
+    msg += `\n\n⚠️ このレコードは以下から参照されています:\n${list}\n\n削除しても関連レコードは消えませんが、表示が「（削除済）」になります。重要な参照がある場合は、先に関連レコードを整理することを推奨します。`;
+  }
+  return msg;
+};
+
+const addAudit = (data, action, entity, summary) => ({
+  ...data,
+  auditLog: [{id:newId("log"), ts:new Date().toISOString(), action, entity, summary}, ...(data.auditLog||[]).slice(0,999)]
+});
+
+/* ==========================================================================
+   App Root
+   ========================================================================== */
+function App() {
+  const [data, setData] = useState(null); // null = まだロード中
+  const [loadError, setLoadError] = useState(null);
+  const [view, setView] = useState("dashboard");
+  const [editing, setEditing] = useState(null);
+  const [confirmDelete, setConfirmDelete] = useState(null);
+  const [workflow, setWorkflow] = useState(null);
+  const [detailView, setDetailView] = useState(null); // { kind: "building", id }
+  const [externalChange, setExternalChange] = useState(null); // { ts }
+  const [saveState, setSaveState] = useState("idle"); // idle | saving | ok | error
+  const isFirstSave = React.useRef(true);
+
+  // 起動時の非同期ロード（IndexedDB → 旧 localStorage からの自動移行）
+  useEffect(() => {
+    let cancelled = false;
+    loadAllAsync().then(d => { if(!cancelled) setData(d); }).catch(e => { if(!cancelled) setLoadError(e.message || String(e)); });
+    return () => { cancelled = true; };
+  }, []);
+
+  // データ変更時の非同期保存（デバウンス500ms）
+  useEffect(() => {
+    if(!data) return;
+    if(isFirstSave.current) { isFirstSave.current = false; return; } // 初回ロード直後の保存をスキップ
+    setSaveState("saving");
+    window.__kanriSaveListener = (status) => setSaveState(status);
+    saveAllAsync(data);
+    return () => { window.__kanriSaveListener = null; };
+  }, [data]);
+
+  // クロスタブ同期 (IndexedDBはstorage eventを発火しないため BroadcastChannel を使用)
+  useEffect(() => {
+    if(!window.BroadcastChannel) return;
+    const ch = new BroadcastChannel("kanri_v3_sync");
+    ch.onmessage = (e) => {
+      if(e.data && e.data.type === "data_changed" && e.data.origin !== window.__kanriTabId) {
+        setExternalChange({ts: Date.now()});
+      }
+    };
+    window.__kanriTabId = window.__kanriTabId || Math.random().toString(36).slice(2);
+    window.__kanriBroadcast = () => ch.postMessage({type:"data_changed", origin:window.__kanriTabId, ts:Date.now()});
+    return () => { ch.close(); window.__kanriBroadcast = null; };
+  }, []);
+  useEffect(() => { if(data && !isFirstSave.current && window.__kanriBroadcast) window.__kanriBroadcast(); }, [data]);
+
+  // 容量警告 (4MB到達でコンソール / 100MB でモーダル警告)
+  useEffect(() => {
+    if(!data) return;
+    const usage = getStorageUsage(data);
+    if(usage > 100 * 1024 * 1024 && !window.__kanriHugeWarned) {
+      window.__kanriHugeWarned = true;
+      console.warn(`[Kanri] データサイズ ${(usage/1024/1024).toFixed(0)}MB が大きくなっています。性能低下が予想されるため、Phase 2(バックエンド移行) を検討してください。`);
+    } else if(usage > 4 * 1024 * 1024 && !window.__kanriQuotaThresholdWarned) {
+      window.__kanriQuotaThresholdWarned = true;
+      console.info(`[Kanri] データサイズ ${(usage/1024/1024).toFixed(2)}MB (IndexedDB使用、上限は通常数百MB～数GB)`);
+    }
+  }, [data]);
+
+  // ロード中・エラー画面
+  if(loadError) {
+    return (
+      <div style={{padding:40, fontFamily:"sans-serif"}}>
+        <h2 style={{color:"#9c3a30"}}>データ読込エラー</h2>
+        <p>{loadError}</p>
+        <p>ブラウザを再起動するか、別のブラウザでお試しください。</p>
+      </div>
+    );
+  }
+  if(!data) {
+    return (
+      <div style={{display:"flex", alignItems:"center", justifyContent:"center", minHeight:"100vh", fontFamily:"Noto Serif JP, serif"}}>
+        <div style={{textAlign:"center"}}>
+          <div style={{fontSize:40, color:"#9c3a30", marginBottom:12, letterSpacing:"0.3em"}}>賃</div>
+          <div style={{fontSize:14, color:"#8a8278"}}>データを読み込んでいます…</div>
+        </div>
+      </div>
+    );
+  }
+
+  const counts = useMemo(() => {
+    const c = {};
+    [...ENTITY_ORDER, ...Object.keys(OPS), "billing", "remittance"].forEach(k => c[k] = (data[k]||[]).length);
+    return c;
+  }, [data]);
+
+  const handleSave = useCallback((entityKey, item) => {
+    setData(prev => {
+      const list = prev[entityKey] || [];
+      const exists = list.some(x => x.id === item.id);
+      const next = exists ? list.map(x => x.id === item.id ? item : x) : [...list, item];
+      const cfg = ENTITIES[entityKey] || OPS[entityKey];
+      const label = cfg ? (item[cfg.primaryKey] || item.id) : item.id;
+      return addAudit({...prev, [entityKey]: next}, exists?"update":"create", cfg?.label||entityKey, `${cfg?.label||entityKey}「${label}」を${exists?"更新":"登録"}`);
+    });
+    setEditing(null);
+  }, []);
+
+  const handleDelete = useCallback((entityKey, id) => {
+    setData(prev => {
+      const item = (prev[entityKey]||[]).find(x => x.id === id);
+      const cfg = ENTITIES[entityKey] || OPS[entityKey];
+      const label = item && cfg ? (item[cfg.primaryKey]||id) : id;
+      return addAudit({...prev, [entityKey]: prev[entityKey].filter(x => x.id !== id)}, "delete", cfg?.label||entityKey, `${cfg?.label||entityKey}「${label}」を削除`);
+    });
+    setConfirmDelete(null);
+  }, []);
+
+  const handleApproveApplication = useCallback((appId, contractData) => {
+    setData(prev => {
+      const app = prev.application.find(a => a.id === appId);
+      if(!app) return prev;
+      const updatedApps = prev.application.map(a => a.id === appId ? {...a, status:"承認"} : a);
+      const contract = {
+        id:newId("ct"), ...contractData, applicationId:appId, contractType:"新規", status:"契約中",
+        tenantName: app.applicantName, tenantKana: app.applicantKana, roomId: app.roomId,
+      };
+      const tenant = {
+        id:newId("tnt"), name:app.applicantName, kana:app.applicantKana, birthday:app.birthday,
+        tel:app.applicantTel, email:app.applicantEmail, occupation:app.occupation, roomId:app.roomId,
+        contractStart:contractData.startDate, contractEnd:contractData.endDate, rent:contractData.rent,
+        guarantor:contractData.guarantor, emergencyName:app.emergencyName, emergencyRelation:app.emergencyRelation, emergencyTel:app.emergencyTel
+      };
+      const updatedRooms = prev.room.map(r => r.id === app.roomId ? {...r, status:"入居中"} : r);
+      return addAudit({...prev, application:updatedApps, contract:[...prev.contract, contract], tenant:[...prev.tenant, tenant], room:updatedRooms},
+        "approve", "申込", `申込「${app.applicantName}」を承認し契約「${contract.contractNo}」を作成`);
+    });
+    setWorkflow(null);
+  }, []);
+
+  const handleRenewContract = useCallback((contractId, renewData) => {
+    setData(prev => {
+      const orig = prev.contract.find(c => c.id === contractId);
+      if(!orig) return prev;
+      const newContract = {...orig, id:newId("ct"), ...renewData, contractType:"更新", status:"契約中",
+        memo:(orig.memo?orig.memo+"\n":"")+`[更新元: ${orig.contractNo}]`};
+      const updated = prev.contract.map(c => c.id === contractId ? {...c, status:"解約済", memo:(c.memo?c.memo+"\n":"")+`[更新先: ${newContract.contractNo}]`} : c);
+      return addAudit({...prev, contract:[...updated, newContract]}, "renew", "契約", `契約「${orig.contractNo}」を更新（新: ${newContract.contractNo}）`);
+    });
+    setWorkflow(null);
+  }, []);
+
+  const handleTerminateContract = useCallback((contractId, termData) => {
+    setData(prev => {
+      const orig = prev.contract.find(c => c.id === contractId);
+      if(!orig) return prev;
+      const updated = prev.contract.map(c => c.id === contractId ? {...c, status:"解約済", ...termData} : c);
+      const updatedRooms = prev.room.map(r => r.id === orig.roomId ? {...r, status:"空室"} : r);
+      return addAudit({...prev, contract:updated, room:updatedRooms}, "terminate", "契約", `契約「${orig.contractNo}」を解約（${termData.terminationDate}）`);
+    });
+    setWorkflow(null);
+  }, []);
+
+  const handleGenerateBillings = useCallback((year, month) => {
+    setData(prev => {
+      const existing = prev.billing.filter(b => b.year === year && b.month === month);
+      const existingContractIds = new Set(existing.map(b => b.contractId));
+      const active = prev.contract.filter(c => c.status === "契約中" || c.status === "解約予定");
+      const dueDay = String(prev.settings.defaultDueDay || 27).padStart(2,"0");
+      const newBs = active.filter(c => !existingContractIds.has(c.id)).map(c => ({
+        id:newId("bil"), contractId:c.id, year, month,
+        billingDate:`${year}-${String(month).padStart(2,"0")}-01`,
+        dueDate:`${year}-${String(month).padStart(2,"0")}-${dueDay}`,
+        rentAmount:Number(c.rent)||0, feeAmount:Number(c.fee)||0, otherAmount:0, otherNote:"",
+        totalAmount:(Number(c.rent)||0)+(Number(c.fee)||0), paidAmount:0, status:"未入金", memo:""
+      }));
+      return addAudit({...prev, billing:[...prev.billing, ...newBs]}, "generate", "請求", `${year}年${month}月分の請求を${newBs.length}件作成（既存${existing.length}件はスキップ）`);
+    });
+    setWorkflow(null);
+  }, []);
+
+  const handleRecordPayment = useCallback((billingId, paymentData) => {
+    setData(prev => {
+      const billing = prev.billing.find(b => b.id === billingId);
+      if(!billing) return prev;
+      const payment = {id:newId("pay"), billingId, ...paymentData};
+      const newPaid = (Number(billing.paidAmount)||0) + Number(paymentData.amount);
+      const total = Number(billing.totalAmount)||0;
+      const newStatus = newPaid >= total ? "入金済" : (newPaid <= 0 ? "未入金" : "一部入金");
+      const updated = prev.billing.map(b => b.id === billingId ? {...b, paidAmount:newPaid, status:newStatus} : b);
+      return addAudit({...prev, billing:updated, payment:[...prev.payment, payment]}, "payment", "請求", `請求(${billing.year}/${billing.month} ${refLabel(prev,"contract",billing.contractId)}) に${fmtMoney(paymentData.amount)}入金`);
+    });
+    setWorkflow(null);
+  }, []);
+
+  const handleGenerateRemittances = useCallback((year, month) => {
+    setData(prev => {
+      const existing = new Set(prev.remittance.filter(r => r.year === year && r.month === month).map(r => r.ownerId));
+      const feeRate = (Number(prev.settings.managementFeeRate)||0) / 100;
+      const newRems = [];
+      for(const owner of prev.owner) {
+        if(existing.has(owner.id)) continue;
+        const ownerBldgIds = prev.building.filter(b => b.ownerId === owner.id).map(b => b.id);
+        if(ownerBldgIds.length === 0) continue;
+        const ownerRoomIds = prev.room.filter(r => ownerBldgIds.includes(r.buildingId)).map(r => r.id);
+        const ownerContractIds = prev.contract.filter(c => ownerRoomIds.includes(c.roomId)).map(c => c.id);
+        const targetBs = prev.billing.filter(b => b.year === year && b.month === month && ownerContractIds.includes(b.contractId));
+        const totalRent = targetBs.reduce((s,b) => s + (Number(b.paidAmount)||0), 0);
+        const ymStart = `${year}-${String(month).padStart(2,"0")}-01`;
+        const lastDay = new Date(year, month, 0).getDate(); // proper last day of month
+        const ymEnd = `${year}-${String(month).padStart(2,"0")}-${String(lastDay).padStart(2,"0")}`;
+        const repairs = prev.repair.filter(r => ownerBldgIds.includes(r.buildingId) && r.paidBy === "家主負担" && r.completionDate >= ymStart && r.completionDate <= ymEnd).reduce((s,r) => s + (Number(r.cost)||0), 0);
+        const mgmtFee = Math.round(totalRent * feeRate);
+        const netAmount = totalRent - mgmtFee - repairs;
+        newRems.push({
+          id:newId("rmt"), ownerId:owner.id, year, month,
+          totalRentReceived:totalRent, managementFee:mgmtFee, managementFeeRate:prev.settings.managementFeeRate,
+          repairs, otherDeductions:0, otherIncome:0, netAmount, status:"未送金", paidDate:"", memo:""
+        });
+      }
+      return addAudit({...prev, remittance:[...prev.remittance, ...newRems]}, "generate", "送金", `${year}年${month}月分の家主送金を${newRems.length}件作成`);
+    });
+    setWorkflow(null);
+  }, []);
+
+  const handleMarkRemittanceSent = useCallback((remId, paidDate) => {
+    setData(prev => {
+      const r = prev.remittance.find(x => x.id === remId);
+      const ownerName = r ? refLabel(prev,"owner",r.ownerId) : "";
+      return addAudit({...prev, remittance:prev.remittance.map(x => x.id === remId ? {...x, status:"送金済", paidDate} : x)}, "remit", "送金", `${ownerName} の送金を送金済に更新`);
+    });
+  }, []);
+
+  const handleSettingsChange = useCallback((next) => {
+    setData(prev => addAudit({...prev, settings:next}, "update", "設定", "システム設定を更新"));
+  }, []);
+
+  const seedSampleData = () => {
+    if(!confirm("サンプルデータを投入します。よろしいですか？")) return;
+    const own1 = {id:newId("own"), name:"田中 太郎", kana:"タナカ タロウ", type:"個人", address:"大阪府大阪市北区梅田1-1-1", tel:"06-1234-5678", bank:"三井住友銀行", branch:"梅田支店", accountType:"普通", accountNo:"1234567"};
+    const own2 = {id:newId("own"), name:"株式会社サンプル不動産", kana:"サンプルフドウサン", type:"法人", address:"大阪府大阪市中央区本町2-2-2", tel:"06-2345-6789"};
+    const bld1 = {id:newId("bld"), name:"梅田ハイツ", kana:"ウメダハイツ", ownerId:own1.id, address:"大阪府大阪市北区梅田1-1-1", structure:"RC", floors:5, totalUnits:20, builtYear:2010, builtMonth:4, parking:"あり"};
+    const bld2 = {id:newId("bld"), name:"本町レジデンス", kana:"ホンマチレジデンス", ownerId:own2.id, address:"大阪府大阪市中央区本町2-2-2", structure:"SRC", floors:8, totalUnits:32, builtYear:2018, builtMonth:10, parking:"近隣"};
+    const rm1 = {id:newId("rm"), buildingId:bld1.id, roomNo:"101", floor:1, layout:"1K", area:25.5, direction:"南", status:"入居中", rent:68000, fee:5000, deposit:68000, keyMoney:0};
+    const rm2 = {id:newId("rm"), buildingId:bld1.id, roomNo:"201", floor:2, layout:"1LDK", area:38.0, direction:"南東", status:"募集中", rent:92000, fee:6000, deposit:92000, keyMoney:92000};
+    const rm3 = {id:newId("rm"), buildingId:bld2.id, roomNo:"501", floor:5, layout:"2LDK", area:55.2, direction:"南", status:"入居中", rent:145000, fee:8000, deposit:290000, keyMoney:145000};
+    const tnt1 = {id:newId("tnt"), name:"山田 花子", kana:"ヤマダ ハナコ", tel:"090-1111-2222", email:"yamada@example.com", roomId:rm1.id, contractStart:"2023-04-01", contractEnd:"2025-03-31", rent:68000, guarantor:"全保連"};
+    const tnt2 = {id:newId("tnt"), name:"佐藤 健", kana:"サトウ ケン", tel:"090-3333-4444", roomId:rm3.id, contractStart:"2024-06-01", contractEnd:"2026-05-31", rent:145000, guarantor:"JID"};
+    const vnd1 = {id:newId("vnd"), name:"大阪クリーンサービス", kana:"オオサカクリーンサービス", category:"清掃", person:"佐藤", tel:"06-3456-7890"};
+    const vnd2 = {id:newId("vnd"), name:"関西修繕工房", kana:"カンサイシュウゼンコウボウ", category:"修繕", person:"鈴木", tel:"06-4567-8901"};
+    const ct1 = {id:newId("ct"), contractNo:"CT-2023-001", contractType:"新規", tenantName:"山田 花子", tenantKana:"ヤマダ ハナコ", roomId:rm1.id, contractDate:"2023-03-15", startDate:"2023-04-01", endDate:"2025-03-31", rent:68000, fee:5000, deposit:68000, keyMoney:0, status:"契約中", guarantor:"全保連"};
+    const ct2 = {id:newId("ct"), contractNo:"CT-2024-001", contractType:"新規", tenantName:"佐藤 健", tenantKana:"サトウ ケン", roomId:rm3.id, contractDate:"2024-05-10", startDate:"2024-06-01", endDate:"2026-05-31", rent:145000, fee:8000, deposit:290000, keyMoney:145000, status:"契約中", guarantor:"JID"};
+    const app1 = {id:newId("app"), applicantName:"鈴木 一郎", applicantKana:"スズキ イチロウ", applicantTel:"090-5555-6666", roomId:rm2.id, applicationDate:todayLocal(), status:"審査中", occupation:"○○商事株式会社", annualIncome:5000000};
+    setData(prev => addAudit({...prev,
+      owner:[...prev.owner, own1, own2], building:[...prev.building, bld1, bld2],
+      room:[...prev.room, rm1, rm2, rm3], tenant:[...prev.tenant, tnt1, tnt2],
+      vendor:[...prev.vendor, vnd1, vnd2], contract:[...prev.contract, ct1, ct2],
+      application:[...prev.application, app1]
+    }, "seed", "システム", "サンプルデータを投入"));
+  };
+
+  const clearAllData = () => { if(!confirm("すべてのデータを削除します。元に戻せません。よろしいですか？")) return; setData(emptyData()); };
+
+  const renderView = () => {
+    if(detailView?.kind === "building") return <BuildingDetailPage data={data} buildingId={detailView.id} onBack={() => setDetailView(null)} onEditBuilding={(item) => setEditing({entity:"building", item})} onNav={(v) => { setDetailView(null); setView(v); }} />;
+    if(view === "dashboard") return <Dashboard data={data} counts={counts} onSeed={seedSampleData} onClear={clearAllData} onNav={setView} />;
+    if(ENTITY_ORDER.includes(view)) return <EntityPage entityKey={view} data={data}
+      onAdd={() => setEditing({entity:view, item:null})}
+      onEdit={(item) => setEditing({entity:view, item})}
+      onDelete={(item) => {
+        const cfg = ENTITIES[view];
+        const label = view === "room" ? `${refLabel(data,"building",item.buildingId)} ${item.roomNo}号室` : (item[cfg.primaryKey]||"（無名）");
+        setConfirmDelete({entity:view, id:item.id, label});
+      }}
+      onDetail={view === "building" ? (item) => setDetailView({kind:"building", id:item.id}) : undefined} />;
+    if(view === "application") return <ApplicationPage data={data} setEditing={setEditing} setConfirmDelete={setConfirmDelete} setWorkflow={setWorkflow} />;
+    if(view === "contract") return <ContractPage data={data} setEditing={setEditing} setConfirmDelete={setConfirmDelete} setWorkflow={setWorkflow} />;
+    if(view === "billing") return <BillingPage data={data} setWorkflow={setWorkflow} />;
+    if(view === "remittance") return <RemittancePage data={data} setWorkflow={setWorkflow} onMarkSent={handleMarkRemittanceSent} />;
+    if(view === "vendorPayment") return <EntityPage entityKey="vendorPayment" data={data}
+      onAdd={() => setEditing({entity:"vendorPayment", item:null})}
+      onEdit={(item) => setEditing({entity:"vendorPayment", item})}
+      onDelete={(item) => setConfirmDelete({entity:"vendorPayment", id:item.id, label:item.purpose||"（無題）"})} />;
+    if(view === "construction") return <EntityPage entityKey="construction" data={data}
+      onAdd={() => setEditing({entity:"construction", item:null})}
+      onEdit={(item) => setEditing({entity:"construction", item})}
+      onDelete={(item) => setConfirmDelete({entity:"construction", id:item.id, label:item.name||item.projectNo||"（無題）"})} />;
+    if(view === "ticket") return <TicketRepairPage data={data} setEditing={setEditing} setConfirmDelete={setConfirmDelete} />;
+    if(view === "analytics") return <AnalyticsPage data={data} />;
+    if(view === "cashflow") return <CashflowPage data={data} onSaveAnalysis={(item) => handleSave("aiAnalysis", item)} />;
+    if(view === "accounting") return <AccountingExportPage data={data} />;
+    if(view === "auditLog") return <AuditLogPage data={data} />;
+    if(view === "settings") return <SettingsPage data={data} onChange={handleSettingsChange} />;
+    return null;
+  };
+
+  return (
+    <div className="app">
+      <Sidebar view={view} setView={setView} counts={counts} data={data} />
+      <main className="main">
+        {externalChange && (
+          <div className="banner warn" style={{marginBottom:20}}>
+            <strong>⚠️ 別タブでデータが更新されました。</strong> このタブの表示は古い可能性があります。編集内容を失わないため、必要な変更を保存したうえで
+            <button className="btn btn-sm" style={{marginLeft:8}} onClick={() => location.reload()}>このタブを再読込</button>
+            してください。
+          </div>
+        )}
+        {renderView()}
+        <div className="footer-credit">Kanri System · V3 · IndexedDB</div>
+      </main>
+
+      {/* 保存状態インジケータ (右下) */}
+      <div style={{position:"fixed", right:16, bottom:16, padding:"6px 12px", borderRadius:999, fontSize:11, fontWeight:500, letterSpacing:"0.05em", boxShadow:"var(--shadow-sm)", border:"1px solid var(--border)", transition:"opacity .2s", opacity: saveState === "idle" ? 0 : 1,
+        background: saveState === "saving" ? "var(--warning-soft)" : saveState === "ok" ? "var(--success-soft)" : "var(--danger-soft)",
+        color: saveState === "saving" ? "var(--warning)" : saveState === "ok" ? "var(--success)" : "var(--danger)"}}>
+        {saveState === "saving" ? "● 保存中..." : saveState === "ok" ? "✓ 保存済" : saveState === "error" ? "✗ 保存失敗" : ""}
+      </div>
+
+      {editing && <FormModal entityKey={editing.entity} item={editing.item} data={data} onClose={() => setEditing(null)} onSave={(item) => handleSave(editing.entity, item)} />}
+      {confirmDelete && <ConfirmModal title="削除確認" message={buildDeleteMessage(data, confirmDelete)} confirmLabel="削除する" onConfirm={() => handleDelete(confirmDelete.entity, confirmDelete.id)} onCancel={() => setConfirmDelete(null)} />}
+      {workflow?.kind === "approve" && <ApproveApplicationModal data={data} application={workflow.payload} onClose={() => setWorkflow(null)} onConfirm={(d) => handleApproveApplication(workflow.payload.id, d)} />}
+      {workflow?.kind === "renew" && <RenewContractModal contract={workflow.payload} onClose={() => setWorkflow(null)} onConfirm={(d) => handleRenewContract(workflow.payload.id, d)} />}
+      {workflow?.kind === "terminate" && <TerminateContractModal contract={workflow.payload} onClose={() => setWorkflow(null)} onConfirm={(d) => handleTerminateContract(workflow.payload.id, d)} />}
+      {workflow?.kind === "generateBilling" && <BulkBillingModal onClose={() => setWorkflow(null)} onConfirm={({year,month}) => handleGenerateBillings(year, month)} />}
+      {workflow?.kind === "recordPayment" && <RecordPaymentModal billing={workflow.payload} data={data} onClose={() => setWorkflow(null)} onConfirm={(d) => handleRecordPayment(workflow.payload.id, d)} />}
+      {workflow?.kind === "generateRemittance" && <GenerateRemittanceModal onClose={() => setWorkflow(null)} onConfirm={({year,month}) => handleGenerateRemittances(year, month)} />}
+      {workflow?.kind === "remittanceDetail" && <RemittanceDetailModal remittance={workflow.payload} data={data} onClose={() => setWorkflow(null)} />}
+    </div>
+  );
+}
+
+function Sidebar({view, setView, counts, data}) {
+  return (
+    <aside className="sidebar">
+      <div className="brand">
+        <div className="brand-mark">Kanri System</div>
+        <div className="brand-title">賃貸管理</div>
+        <div className="brand-subtitle">RENTAL ADMIN · V2</div>
+      </div>
+      <div className="nav-section-label">概況</div>
+      <NavItem view="dashboard" current={view} setView={setView} glyph="◇" label="ダッシュボード" />
+      <div className="nav-section-label">台帳</div>
+      {ENTITY_ORDER.map(k => <NavItem key={k} view={k} current={view} setView={setView} glyph={ENTITIES[k].glyph} label={ENTITIES[k].label} count={counts[k]} />)}
+      <div className="nav-section-label">業務</div>
+      <NavItem view="application" current={view} setView={setView} glyph="申" label="申込管理" count={counts.application} />
+      <NavItem view="contract" current={view} setView={setView} glyph="契" label="契約管理" count={counts.contract} />
+      <NavItem view="billing" current={view} setView={setView} glyph="請" label="請求・入金" count={counts.billing} />
+      <NavItem view="remittance" current={view} setView={setView} glyph="送" label="家主送金" count={counts.remittance} />
+      <NavItem view="vendorPayment" current={view} setView={setView} glyph="払" label="業者支払" count={counts.vendorPayment} />
+      <NavItem view="construction" current={view} setView={setView} glyph="工" label="工事案件" count={counts.construction} />
+      <NavItem view="ticket" current={view} setView={setView} glyph="問" label="問い合わせ・修繕" count={counts.ticket} />
+      <div className="nav-section-label">管理</div>
+      <NavItem view="analytics" current={view} setView={setView} glyph="析" label="分析レポート" />
+      <NavItem view="cashflow" current={view} setView={setView} glyph="金" label="キャッシュフロー" />
+      <NavItem view="accounting" current={view} setView={setView} glyph="仕" label="仕訳出力" />
+      <NavItem view="auditLog" current={view} setView={setView} glyph="録" label="操作ログ" />
+      <NavItem view="settings" current={view} setView={setView} glyph="設" label="設定" />
+    </aside>
+  );
+}
+
+function NavItem({view, current, setView, glyph, label, count}) {
+  return (
+    <div className={`nav-item ${current===view?"active":""}`} onClick={() => setView(view)}>
+      <span className="nav-glyph">{glyph}</span>
+      <span>{label}</span>
+      {count !== undefined && <span className="nav-count">{count}</span>}
+    </div>
+  );
+}
+
+function Stat({label, value, unit, format, meta, className}) {
+  const display = format === "money" ? fmtMoney(value) : (value==null||isNaN(Number(value)) ? "—" : Number(value).toLocaleString("ja-JP"));
+  return (
+    <div className={`stat ${className||""}`}>
+      <div className="stat-label">{label}</div>
+      <div className="stat-value">{display}{unit && <span className="stat-unit">{unit}</span>}</div>
+      {meta && <div className="stat-meta">{meta}</div>}
+    </div>
+  );
+}
+
+function Dashboard({data, counts, onSeed, onClear, onNav}) {
+  const occupancy = useMemo(() => {
+    const rooms = data.room||[]; const total = rooms.length||1;
+    const occupied = rooms.filter(r => r.status === "入居中").length;
+    const vacant = rooms.filter(r => r.status === "空室").length;
+    const listed = rooms.filter(r => r.status === "募集中").length;
+    return {total:rooms.length, occupied, vacant, listed, occupiedPct:(occupied/total)*100, vacantPct:(vacant/total)*100, listedPct:(listed/total)*100, rate:rooms.length===0?0:Math.round((occupied/rooms.length)*100)};
+  }, [data.room]);
+  const monthlyExpected = useMemo(() => (data.contract||[]).filter(c => c.status === "契約中").reduce((s,c) => s+(Number(c.rent)||0)+(Number(c.fee)||0), 0), [data.contract]);
+  const {year,month} = currentYM();
+  const thisMonthBs = (data.billing||[]).filter(b => b.year===year && b.month===month);
+  const thisReceived = thisMonthBs.reduce((s,b) => s+(Number(b.paidAmount)||0), 0);
+  const thisOutstanding = thisMonthBs.reduce((s,b) => s+((Number(b.totalAmount)||0)-(Number(b.paidAmount)||0)), 0);
+  const collRate = thisMonthBs.length===0?0:Math.round((thisReceived/Math.max(thisMonthBs.reduce((s,b)=>s+(Number(b.totalAmount)||0),0),1))*100);
+  const pendingApps = (data.application||[]).filter(a => a.status === "申込中" || a.status === "審査中").length;
+  const openTickets = (data.ticket||[]).filter(t => t.status !== "完了").length;
+  const expiring = useMemo(() => {
+    const now = new Date(); const th = new Date(now.getFullYear(), now.getMonth()+3, now.getDate());
+    return (data.contract||[]).filter(c => { if(c.status !== "契約中") return false; const e = new Date(c.endDate); return !isNaN(e) && e <= th && e >= now; });
+  }, [data.contract]);
+  const recentLogs = (data.auditLog||[]).slice(0,5);
+
+  return (
+    <>
+      <div className="page-head">
+        <div className="page-title-block">
+          <div className="page-kicker">Overview</div>
+          <h1 className="page-title">ダッシュボード</h1>
+          <div className="page-subtitle">{fmtYM(year,month)} 時点の管理ポートフォリオ概況</div>
+        </div>
+        <div className="page-actions">
+          {counts.owner === 0 ? <button className="btn btn-primary" onClick={onSeed}>サンプルデータを投入</button> : (
+            <><button className="btn" onClick={onSeed}>サンプル追加投入</button><button className="btn btn-danger" onClick={onClear}>全データ削除</button></>
+          )}
+        </div>
+      </div>
+
+      <div className="stat-grid">
+        <Stat label="管理物件" value={counts.building} unit="棟" meta={`${counts.room}室`} />
+        <Stat label="入居率" value={occupancy.rate} unit="%" meta={`入居 ${occupancy.occupied}室 / 募集 ${occupancy.listed}室`} className={occupancy.rate>=90?"success":occupancy.rate>=70?"":"warn"} />
+        <Stat label="月額想定賃料" value={monthlyExpected} format="money" meta="契約中の合計" />
+        <Stat label="今月入金" value={thisReceived} format="money" meta={`収納率 ${collRate}%`} className="success" />
+        <Stat label="今月未収" value={thisOutstanding} format="money" meta={`${thisMonthBs.filter(b=>b.status!=="入金済").length}件`} className={thisOutstanding>0?"warn":""} />
+      </div>
+
+      <div className="dash-row">
+        <div className="dash-card">
+          <div className="dash-card-title"><span>入居状況</span><span className="meta">{occupancy.total} 室</span></div>
+          {occupancy.total === 0 ? <div className="muted" style={{padding:"20px 0", fontSize:12}}>部屋データを登録すると表示されます</div> : <>
+            <div className="occupancy-bar">
+              <div className="occupancy-seg occupied" style={{width:`${occupancy.occupiedPct}%`}} />
+              <div className="occupancy-seg listed" style={{width:`${occupancy.listedPct}%`}} />
+              <div className="occupancy-seg vacant" style={{width:`${occupancy.vacantPct}%`}} />
+            </div>
+            <div className="legend-row">
+              <span><span className="legend-dot" style={{background:"var(--success)"}}></span>入居中 {occupancy.occupied}室</span>
+              <span><span className="legend-dot" style={{background:"var(--warning)"}}></span>募集中 {occupancy.listed}室</span>
+              <span><span className="legend-dot" style={{background:"var(--accent)"}}></span>空室 {occupancy.vacant}室</span>
+            </div>
+          </>}
+        </div>
+        <div className="dash-card">
+          <div className="dash-card-title"><span>要対応</span><span className="meta">Pending</span></div>
+          <div className="kv-grid">
+            <dt>申込（未処理）</dt><dd><span className="row-link" onClick={() => onNav("application")}>{pendingApps} 件</span></dd>
+            <dt>問い合わせ（未完了）</dt><dd><span className="row-link" onClick={() => onNav("ticket")}>{openTickets} 件</span></dd>
+            <dt>3ヶ月以内に契約期限切れ</dt><dd><span className="row-link" onClick={() => onNav("contract")}>{expiring.length} 件</span></dd>
+            <dt>今月未入金請求</dt><dd><span className="row-link" onClick={() => onNav("billing")}>{thisMonthBs.filter(b=>b.status!=="入金済").length} 件</span></dd>
+          </div>
+        </div>
+      </div>
+
+      <div className="dash-row">
+        <div className="dash-card">
+          <div className="dash-card-title"><span>契約期限が近い</span><span className="meta">3 Months</span></div>
+          {expiring.length === 0 ? <div className="muted" style={{padding:12, fontSize:12}}>該当なし</div> : (
+            <table className="data" style={{width:"100%"}}><tbody>
+              {expiring.slice(0,8).map(c => (
+                <tr key={c.id}>
+                  <td className="primary-cell">{c.tenantName}<span className="sub">{refLabel(data,"room",c.roomId)}</span></td>
+                  <td className="tabular" style={{textAlign:"right"}}>{fmtDate(c.endDate)}</td>
+                </tr>
+              ))}
+            </tbody></table>
+          )}
+        </div>
+        <div className="dash-card">
+          <div className="dash-card-title"><span>最近の操作</span><span className="meta">Activity</span></div>
+          {recentLogs.length === 0 ? <div className="muted" style={{padding:12, fontSize:12}}>操作履歴がここに表示されます</div> : (
+            <div className="log-list">
+              {recentLogs.map(l => (
+                <div key={l.id} className="log-item">
+                  <span className="log-time">{fmtDateTime(l.ts)}</span>
+                  <span><span className="badge badge-neutral">{l.entity}</span></span>
+                  <span className="log-summary">{l.summary}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+/* ==========================================================================
+   Generic Entity Page
+   ========================================================================== */
+function EntityPage({entityKey, data, onAdd, onEdit, onDelete, onDetail}) {
+  const cfg = ENTITIES[entityKey] || OPS[entityKey];
+  const items = data[entityKey] || [];
+  const [query, setQuery] = useState("");
+  const [page, setPage] = useState(1);
+  const PAGE_SIZE = 50;
+  const dq = useDebounce(query, 300);
+  useEffect(() => { setPage(1); }, [dq, entityKey]); // 検索・遷移時にページリセット
+  const filtered = useMemo(() => {
+    if(!dq.trim()) return items;
+    const q = dq.trim().toLowerCase();
+    // 早期打ち切り付きフィルタ (10万件中ヒット上限500件で停止)
+    return filterWithLimit(items, it => Object.values(it).some(v => v != null && String(v).toLowerCase().includes(q)), 500);
+  }, [items, dq]);
+  const paged = useMemo(() => filtered.slice((page-1)*PAGE_SIZE, page*PAGE_SIZE), [filtered, page]);
+  return (
+    <>
+      <div className="page-head">
+        <div className="page-title-block">
+          <div className="page-kicker">{ENTITY_ORDER.includes(entityKey) ? "Master Data" : "Operations"}</div>
+          <h1 className="page-title">{cfg.label}{ENTITY_ORDER.includes(entityKey) ? "台帳" : "一覧"}</h1>
+          <div className="page-subtitle">登録件数: {items.length.toLocaleString()} 件{dq && `（${filtered.length}件ヒット${filtered.length >= 500 ? "+" : ""}）`}</div>
+        </div>
+        <div className="page-actions">
+          <div className="search-box"><span className="search-icon">⌕</span>
+            <input type="text" placeholder={`${cfg.label}を検索...`} value={query} onChange={e => setQuery(e.target.value)} />
+          </div>
+          <button className="btn" disabled={filtered.length === 0} onClick={() => {
+            const csv = entityToCsv(cfg, filtered, data);
+            downloadFile(`${cfg.label}_${todayLocal()}.csv`, csv, "text/csv;charset=utf-8");
+          }}>CSV出力</button>
+          <button className="btn btn-primary" onClick={onAdd}>＋ {cfg.label}を追加</button>
+        </div>
+      </div>
+      {filtered.length === 0 ? (
+        <div className="card"><div className="empty"><span className="empty-glyph">{cfg.glyph}</span>
+          <div className="empty-title">{items.length === 0 ? `${cfg.label}が登録されていません` : "該当する結果がありません"}</div>
+          <div className="empty-text">{items.length === 0 ? `右上の「＋ ${cfg.label}を追加」から登録できます。` : "検索条件を変えてお試しください。"}</div>
+        </div></div>
+      ) : (
+        <div className="card">
+          <div className="table-wrap">
+            <EntityTable cfg={cfg} items={paged} data={data} onEdit={onEdit} onDelete={onDelete}
+              extraActions={onDetail ? (item) => <button className="btn btn-sm btn-ghost" onClick={() => onDetail(item)}>詳細</button> : undefined} />
+          </div>
+          <Pagination page={page} setPage={setPage} total={filtered.length} pageSize={PAGE_SIZE} />
+        </div>
+      )}
+    </>
+  );
+}
+
+function EntityTable({cfg, items, data, onEdit, onDelete, extraActions}) {
+  const cols = cfg.listColumns;
+  const headers = cols.map(k => {
+    if(k === "ownerId") return "家主";
+    if(k === "buildingId") return "建物";
+    if(k === "roomId") return "部屋";
+    if(k === "vendorId") return "業者";
+    if(k === "rooms") return "部屋数";
+    if(k === "tenantName") return "契約者";
+    for(const sec of cfg.sections) { const f = sec.fields.find(f => f.key === k); if(f) return f.label; }
+    return k;
+  });
+  return (
+    <table className="data">
+      <thead><tr>{headers.map((h,i) => <th key={i}>{h}</th>)}<th className="col-actions">操作</th></tr></thead>
+      <tbody>
+        {items.map(item => (
+          <tr key={item.id}>
+            {cols.map((colKey, i) => (
+              <td key={colKey} className={isNumericKey(colKey) ? "col-num" : ""}>{renderCell(cfg, item, colKey, data, i === 0)}</td>
+            ))}
+            <td className="col-actions">
+              {extraActions && extraActions(item)}
+              <button className="btn btn-sm btn-ghost" onClick={() => onEdit(item)}>編集</button>
+              <button className="btn btn-sm btn-ghost btn-danger" onClick={() => onDelete(item)}>削除</button>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function isNumericKey(k) {
+  return ["rent","fee","deposit","keyMoney","area","floors","totalUnits","rooms","amount","cost","totalAmount","paidAmount","netAmount","annualIncome"].includes(k);
+}
+
+function renderCell(cfg, item, colKey, data, isFirst) {
+  if(colKey === "ownerId") return refLabel(data,"owner",item.ownerId);
+  if(colKey === "buildingId") return refLabel(data,"building",item.buildingId);
+  if(colKey === "roomId") return refLabel(data,"room",item.roomId);
+  if(colKey === "vendorId") return refLabel(data,"vendor",item.vendorId);
+  if(colKey === "tenantName") return item.tenantName || "—";
+  if(colKey === "rooms") { const n = (data.room||[]).filter(r => r.buildingId === item.id).length; return <span className="tabular">{n} 室</span>; }
+  const v = item[colKey];
+  if(colKey === "status") {
+    const map = {"入居中":"badge-success","空室":"badge-danger","募集中":"badge-warning","申込中":"badge-info","審査中":"badge-warning","承認":"badge-success","否認":"badge-neutral","契約中":"badge-success","解約予定":"badge-warning","解約済":"badge-neutral","未入金":"badge-danger","一部入金":"badge-warning","入金済":"badge-success","滞納":"badge-danger","予定":"badge-info","支払済":"badge-success","実施中":"badge-warning","完了":"badge-success","受付":"badge-info","対応中":"badge-warning","業者手配":"badge-warning","未送金":"badge-warning","送金済":"badge-success"};
+    return <span className={`badge ${map[v]||"badge-neutral"}`}>{v||"—"}</span>;
+  }
+  if(colKey === "type") return <span className={`badge ${v === "法人" ? "badge-info" : "badge-neutral"}`}>{v||"—"}</span>;
+  if(colKey === "priority") { const map = {"高":"badge-danger","中":"badge-warning","低":"badge-neutral"}; return <span className={`badge ${map[v]||"badge-neutral"}`}>{v||"—"}</span>; }
+  if(["rent","fee","deposit","keyMoney","amount","cost","totalAmount","paidAmount","netAmount","annualIncome"].includes(colKey)) return <span className="tabular">{fmtMoney(v)}</span>;
+  if(["contractStart","contractEnd","birthday","applicationDate","moveInWish","contractDate","startDate","endDate","paymentDate","paidDate","inquiryDate","scheduledDate","completionDate","billingDate","dueDate"].includes(colKey)) return <span className="tabular">{fmtDate(v)}</span>;
+  if(isFirst) {
+    const sub = cfg.secondaryKey ? item[cfg.secondaryKey] : null;
+    return <div className="primary-cell">{v||"（無名）"}{sub && <span className="sub">{sub}</span>}</div>;
+  }
+  return v || "—";
+}
+
+/* ==========================================================================
+   Application Page
+   ========================================================================== */
+function ApplicationPage({data, setEditing, setConfirmDelete, setWorkflow}) {
+  const [statusFilter, setStatusFilter] = useState("ALL");
+  const items = data.application || [];
+  const cfg = OPS.application;
+  const filtered = statusFilter === "ALL" ? items : items.filter(i => i.status === statusFilter);
+  const counts = useMemo(() => { const c = {ALL:items.length}; cfg.statuses.forEach(s => c[s] = items.filter(i => i.status === s).length); return c; }, [items]);
+  return (
+    <>
+      <div className="page-head">
+        <div className="page-title-block">
+          <div className="page-kicker">Operations</div>
+          <h1 className="page-title">申込管理</h1>
+          <div className="page-subtitle">入居申込の受付・審査・承認</div>
+        </div>
+        <div className="page-actions">
+          <button className="btn btn-primary" onClick={() => setEditing({entity:"application", item:null})}>＋ 申込を追加</button>
+        </div>
+      </div>
+      <div className="filter-row">
+        <div className={`chip ${statusFilter==="ALL"?"active":""}`} onClick={() => setStatusFilter("ALL")}>すべて<span className="chip-count">{counts.ALL}</span></div>
+        {cfg.statuses.map(s => <div key={s} className={`chip ${statusFilter===s?"active":""}`} onClick={() => setStatusFilter(s)}>{s}<span className="chip-count">{counts[s]||0}</span></div>)}
+      </div>
+      {filtered.length === 0 ? (
+        <div className="card"><div className="empty"><span className="empty-glyph">申</span>
+          <div className="empty-title">{items.length === 0 ? "申込がありません" : "該当する申込がありません"}</div>
+          <div className="empty-text">{items.length === 0 ? "右上から申込を追加できます。" : "フィルタを変えてください。"}</div>
+        </div></div>
+      ) : (
+        <div className="card"><div className="table-wrap"><table className="data">
+          <thead><tr><th>申込日</th><th>申込者</th><th>希望部屋</th><th>入居希望</th><th>状態</th><th className="col-actions">操作</th></tr></thead>
+          <tbody>
+            {filtered.map(a => (
+              <tr key={a.id}>
+                <td className="tabular">{fmtDate(a.applicationDate)}</td>
+                <td className="primary-cell">{a.applicantName}<span className="sub">{a.applicantKana}</span></td>
+                <td>{refLabel(data,"room",a.roomId)}</td>
+                <td className="tabular">{fmtDate(a.moveInWish)}</td>
+                <td>{renderCell(cfg, a, "status", data)}</td>
+                <td className="col-actions">
+                  {(a.status === "申込中" || a.status === "審査中") && (
+                    <button className="btn btn-sm btn-success" onClick={() => setWorkflow({kind:"approve", payload:a})}>承認 → 契約作成</button>
+                  )}
+                  <button className="btn btn-sm btn-ghost" onClick={() => setEditing({entity:"application", item:a})}>編集</button>
+                  <button className="btn btn-sm btn-ghost btn-danger" onClick={() => setConfirmDelete({entity:"application", id:a.id, label:a.applicantName})}>削除</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table></div></div>
+      )}
+    </>
+  );
+}
+
+/* ==========================================================================
+   Contract Page
+   ========================================================================== */
+function ContractPage({data, setEditing, setConfirmDelete, setWorkflow}) {
+  const [statusFilter, setStatusFilter] = useState("ALL");
+  const items = data.contract || [];
+  const cfg = OPS.contract;
+  const filtered = statusFilter === "ALL" ? items : items.filter(i => i.status === statusFilter);
+  const counts = useMemo(() => { const c = {ALL:items.length}; cfg.statuses.forEach(s => c[s] = items.filter(i => i.status === s).length); return c; }, [items]);
+  return (
+    <>
+      <div className="page-head">
+        <div className="page-title-block">
+          <div className="page-kicker">Operations</div>
+          <h1 className="page-title">契約管理</h1>
+          <div className="page-subtitle">契約の新規・更新・解約</div>
+        </div>
+        <div className="page-actions">
+          <button className="btn btn-primary" onClick={() => setEditing({entity:"contract", item:null})}>＋ 契約を追加</button>
+        </div>
+      </div>
+      <div className="filter-row">
+        <div className={`chip ${statusFilter==="ALL"?"active":""}`} onClick={() => setStatusFilter("ALL")}>すべて<span className="chip-count">{counts.ALL}</span></div>
+        {cfg.statuses.map(s => <div key={s} className={`chip ${statusFilter===s?"active":""}`} onClick={() => setStatusFilter(s)}>{s}<span className="chip-count">{counts[s]||0}</span></div>)}
+      </div>
+      {filtered.length === 0 ? (
+        <div className="card"><div className="empty"><span className="empty-glyph">契</span>
+          <div className="empty-title">契約がありません</div>
+          <div className="empty-text">申込から承認すると契約が自動作成されます。または直接「＋ 契約を追加」から登録できます。</div>
+        </div></div>
+      ) : (
+        <div className="card"><div className="table-wrap"><table className="data">
+          <thead><tr><th>契約番号</th><th>契約者</th><th>対象部屋</th><th>契約期間</th><th>賃料</th><th>状態</th><th className="col-actions">操作</th></tr></thead>
+          <tbody>
+            {filtered.map(c => (
+              <tr key={c.id}>
+                <td className="primary-cell">{c.contractNo}<span className="sub">{c.contractType}</span></td>
+                <td>{c.tenantName}</td>
+                <td>{refLabel(data,"room",c.roomId)}</td>
+                <td className="tabular">{fmtDate(c.startDate)} 〜 {fmtDate(c.endDate)}</td>
+                <td className="col-num">{fmtMoney(c.rent)}</td>
+                <td>{renderCell(cfg, c, "status", data)}</td>
+                <td className="col-actions">
+                  {c.status === "契約中" && (<>
+                    <button className="btn btn-sm btn-success" onClick={() => setWorkflow({kind:"renew", payload:c})}>更新</button>
+                    <button className="btn btn-sm" onClick={() => setWorkflow({kind:"terminate", payload:c})}>解約</button>
+                  </>)}
+                  <button className="btn btn-sm btn-ghost" onClick={() => setEditing({entity:"contract", item:c})}>編集</button>
+                  <button className="btn btn-sm btn-ghost btn-danger" onClick={() => setConfirmDelete({entity:"contract", id:c.id, label:c.contractNo})}>削除</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table></div></div>
+      )}
+    </>
+  );
+}
+
+/* ==========================================================================
+   Billing Page
+   ========================================================================== */
+function BillingPage({data, setWorkflow}) {
+  const {year:thisYear, month:thisMonth} = currentYM();
+  const [selYM, setSelYM] = useState(toYM(thisYear, thisMonth));
+  const [statusFilter, setStatusFilter] = useState("ALL");
+  const items = data.billing || [];
+  const [y, m] = selYM.split("-").map(Number);
+  const today = todayLocal();
+  // Compute effective status: 未入金/一部入金 with past dueDate → 滞納
+  const effectiveStatus = (b) => {
+    if(b.status === "入金済") return "入金済";
+    if(b.dueDate && b.dueDate < today) return "滞納";
+    return b.status;
+  };
+  const monthly = useMemo(() => items.filter(b => b.year === y && b.month === m), [items, y, m]);
+  const filtered = useMemo(() => statusFilter === "ALL" ? monthly : monthly.filter(b => effectiveStatus(b) === statusFilter), [monthly, statusFilter]);
+  const [page, setPage] = useState(1);
+  const PAGE_SIZE = 50;
+  useEffect(() => { setPage(1); }, [selYM, statusFilter]);
+  const paged = useMemo(() => filtered.slice((page-1)*PAGE_SIZE, page*PAGE_SIZE), [filtered, page]);
+  const totals = {
+    billed: monthly.reduce((s,b) => s+(Number(b.totalAmount)||0), 0),
+    received: monthly.reduce((s,b) => s+(Number(b.paidAmount)||0), 0),
+    outstanding: monthly.reduce((s,b) => s+((Number(b.totalAmount)||0)-(Number(b.paidAmount)||0)), 0),
+  };
+  const statuses = ["未入金","一部入金","入金済","滞納"];
+  const counts = { ALL: monthly.length };
+  statuses.forEach(s => counts[s] = monthly.filter(b => effectiveStatus(b) === s).length);
+
+  return (
+    <>
+      <div className="page-head">
+        <div className="page-title-block">
+          <div className="page-kicker">Operations</div>
+          <h1 className="page-title">請求・入金</h1>
+          <div className="page-subtitle">{fmtYM(y,m)} の請求 {monthly.length} 件{counts["滞納"] > 0 && <span style={{color:"var(--accent)", fontWeight:600}}> ・ 滞納 {counts["滞納"]} 件</span>}</div>
+        </div>
+        <div className="page-actions">
+          <div className="month-picker"><input type="month" value={selYM} onChange={e => setSelYM(e.target.value)} style={{padding:"8px 10px", border:"1px solid var(--border-strong)", borderRadius:"var(--radius)", fontFamily:"inherit", fontSize:13}} /></div>
+          <button className="btn btn-primary" onClick={() => setWorkflow({kind:"generateBilling", payload:{year:y, month:m}})}>＋ 今月の請求を一括生成</button>
+        </div>
+      </div>
+
+      <div className="stat-grid" style={{gridTemplateColumns:"repeat(3, 1fr)"}}>
+        <Stat label="請求合計" value={totals.billed} format="money" />
+        <Stat label="入金合計" value={totals.received} format="money" className="success" />
+        <Stat label="未収残高" value={totals.outstanding} format="money" className={totals.outstanding > 0 ? "warn" : ""} />
+      </div>
+
+      <div className="filter-row">
+        <div className={`chip ${statusFilter==="ALL"?"active":""}`} onClick={() => setStatusFilter("ALL")}>すべて<span className="chip-count">{counts.ALL}</span></div>
+        {statuses.map(s => <div key={s} className={`chip ${statusFilter===s?"active":""}`} onClick={() => setStatusFilter(s)}>{s}<span className="chip-count">{counts[s]||0}</span></div>)}
+      </div>
+
+      {filtered.length === 0 ? (
+        <div className="card"><div className="empty"><span className="empty-glyph">請</span>
+          <div className="empty-title">{monthly.length === 0 ? "この月の請求はまだありません" : "該当する請求がありません"}</div>
+          <div className="empty-text">{monthly.length === 0 ? "「＋ 今月の請求を一括生成」をクリックすると、契約中の全件分の請求が作成されます。" : "フィルタを変えてください。"}</div>
+        </div></div>
+      ) : (
+        <div className="card">
+          <div className="table-wrap"><table className="data">
+          <thead><tr><th>請求月</th><th>契約</th><th>請求額</th><th>入金額</th><th>未収</th><th>支払期限</th><th>状態</th><th className="col-actions">操作</th></tr></thead>
+          <tbody>
+            {paged.map(b => {
+              const outstanding = (Number(b.totalAmount)||0) - (Number(b.paidAmount)||0);
+              const effStatus = effectiveStatus(b);
+              const isOverdue = effStatus === "滞納";
+              return (
+                <tr key={b.id}>
+                  <td className="tabular">{b.year}/{String(b.month).padStart(2,"0")}</td>
+                  <td className="primary-cell">{refLabel(data,"contract",b.contractId)}<span className="sub">{(() => { const c = data.contract.find(c => c.id === b.contractId); return c ? c.tenantName : ""; })()}</span></td>
+                  <td className="col-num">{fmtMoney(b.totalAmount)}</td>
+                  <td className="col-num">{fmtMoney(b.paidAmount)}</td>
+                  <td className="col-num">{fmtMoney(outstanding)}</td>
+                  <td className="tabular" style={isOverdue ? {color:"var(--accent)", fontWeight:600} : {}}>{fmtDate(b.dueDate)}</td>
+                  <td>{renderCell({sections:[]}, {...b, status:effStatus}, "status", data)}</td>
+                  <td className="col-actions">
+                    <button className="btn btn-sm btn-ghost" onClick={() => openPrintWindow("請求書", buildInvoiceHtml(b, data))}>請求書</button>
+                    {(Number(b.paidAmount)||0) > 0 && (
+                      <button className="btn btn-sm btn-ghost" onClick={() => openPrintWindow("領収書", buildReceiptHtml(b, data))}>領収書</button>
+                    )}
+                    {effStatus !== "入金済" && (
+                      <button className="btn btn-sm btn-success" onClick={() => setWorkflow({kind:"recordPayment", payload:b})}>入金記録</button>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table></div>
+          <Pagination page={page} setPage={setPage} total={filtered.length} pageSize={PAGE_SIZE} />
+        </div>
+      )}
+    </>
+  );
+}
+
+/* ==========================================================================
+   Remittance Page (家主送金)
+   ========================================================================== */
+function RemittancePage({data, setWorkflow, onMarkSent}) {
+  const {year:thisYear, month:thisMonth} = currentYM();
+  const [selYM, setSelYM] = useState(toYM(thisYear, thisMonth));
+  const [statusFilter, setStatusFilter] = useState("ALL");
+  const [y, m] = selYM.split("-").map(Number);
+  const items = (data.remittance||[]).filter(r => r.year === y && r.month === m);
+  const filtered = statusFilter === "ALL" ? items : items.filter(r => r.status === statusFilter);
+  const totals = {
+    rent: items.reduce((s,r) => s+(Number(r.totalRentReceived)||0), 0),
+    fee: items.reduce((s,r) => s+(Number(r.managementFee)||0), 0),
+    repair: items.reduce((s,r) => s+(Number(r.repairs)||0), 0),
+    net: items.reduce((s,r) => s+(Number(r.netAmount)||0), 0),
+  };
+  return (
+    <>
+      <div className="page-head">
+        <div className="page-title-block">
+          <div className="page-kicker">Operations</div>
+          <h1 className="page-title">家主送金</h1>
+          <div className="page-subtitle">{fmtYM(y,m)} の送金 {items.length} 件</div>
+        </div>
+        <div className="page-actions">
+          <div className="month-picker"><input type="month" value={selYM} onChange={e => setSelYM(e.target.value)} style={{padding:"8px 10px", border:"1px solid var(--border-strong)", borderRadius:"var(--radius)", fontFamily:"inherit", fontSize:13}} /></div>
+          <button className="btn btn-primary" onClick={() => setWorkflow({kind:"generateRemittance", payload:{year:y, month:m}})}>＋ 送金データを生成</button>
+        </div>
+      </div>
+
+      <div className="stat-grid" style={{gridTemplateColumns:"repeat(4, 1fr)"}}>
+        <Stat label="入金合計" value={totals.rent} format="money" />
+        <Stat label="管理手数料" value={totals.fee} format="money" />
+        <Stat label="修繕費控除" value={totals.repair} format="money" />
+        <Stat label="送金合計" value={totals.net} format="money" className="success" />
+      </div>
+
+      <div className="filter-row">
+        <div className={`chip ${statusFilter==="ALL"?"active":""}`} onClick={() => setStatusFilter("ALL")}>すべて<span className="chip-count">{items.length}</span></div>
+        <div className={`chip ${statusFilter==="未送金"?"active":""}`} onClick={() => setStatusFilter("未送金")}>未送金<span className="chip-count">{items.filter(r=>r.status==="未送金").length}</span></div>
+        <div className={`chip ${statusFilter==="送金済"?"active":""}`} onClick={() => setStatusFilter("送金済")}>送金済<span className="chip-count">{items.filter(r=>r.status==="送金済").length}</span></div>
+      </div>
+
+      {filtered.length === 0 ? (
+        <div className="card"><div className="empty"><span className="empty-glyph">送</span>
+          <div className="empty-title">{items.length === 0 ? "この月の送金データはまだありません" : "該当データなし"}</div>
+          <div className="empty-text">「＋ 送金データを生成」で、入金済請求から自動計算します。<br/>計算式: 入金額 - 管理手数料({data.settings.managementFeeRate}%) - 家主負担修繕費 = 送金額</div>
+        </div></div>
+      ) : (
+        <div className="card"><div className="table-wrap"><table className="data">
+          <thead><tr><th>家主</th><th>入金額</th><th>管理手数料</th><th>修繕費</th><th>送金額</th><th>状態</th><th className="col-actions">操作</th></tr></thead>
+          <tbody>
+            {filtered.map(r => (
+              <tr key={r.id}>
+                <td className="primary-cell">{refLabel(data,"owner",r.ownerId)}</td>
+                <td className="col-num">{fmtMoney(r.totalRentReceived)}</td>
+                <td className="col-num">{fmtMoney(r.managementFee)}<span style={{fontSize:10, color:"var(--muted)"}}> ({r.managementFeeRate}%)</span></td>
+                <td className="col-num">{fmtMoney(r.repairs)}</td>
+                <td className="col-num" style={{fontWeight:600}}>{fmtMoney(r.netAmount)}</td>
+                <td>{renderCell({sections:[]}, r, "status", data)}</td>
+                <td className="col-actions">
+                  <button className="btn btn-sm btn-ghost" onClick={() => setWorkflow({kind:"remittanceDetail", payload:r})}>明細</button>
+                  <button className="btn btn-sm btn-ghost" onClick={() => openPrintWindow("家主送金明細書", buildRemittanceHtml(r, data))}>送金明細書</button>
+                  {r.status === "未送金" && (
+                    <button className="btn btn-sm btn-success" onClick={() => onMarkSent(r.id, todayLocal())}>送金済にする</button>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table></div></div>
+      )}
+    </>
+  );
+}
+
+/* ==========================================================================
+   Ticket / Repair Page
+   ========================================================================== */
+function TicketRepairPage({data, setEditing, setConfirmDelete}) {
+  const [tab, setTab] = useState("ticket");
+  if(tab === "ticket") {
+    return <>
+      <div className="page-head">
+        <div className="page-title-block">
+          <div className="page-kicker">Operations</div>
+          <h1 className="page-title">問い合わせ・修繕</h1>
+          <div className="page-subtitle">入居者問い合わせと修繕工事の管理</div>
+        </div>
+        <div className="page-actions">
+          <button className="btn btn-primary" onClick={() => setEditing({entity:"ticket", item:null})}>＋ 問い合わせを追加</button>
+        </div>
+      </div>
+      <div className="filter-row">
+        <div className={`chip ${tab==="ticket"?"active":""}`} onClick={() => setTab("ticket")}>問い合わせ<span className="chip-count">{(data.ticket||[]).length}</span></div>
+        <div className={`chip ${tab==="repair"?"active":""}`} onClick={() => setTab("repair")}>修繕履歴<span className="chip-count">{(data.repair||[]).length}</span></div>
+      </div>
+      {(data.ticket||[]).length === 0 ? (
+        <div className="card"><div className="empty"><span className="empty-glyph">問</span>
+          <div className="empty-title">問い合わせがありません</div>
+          <div className="empty-text">右上から問い合わせを追加できます。</div>
+        </div></div>
+      ) : (
+        <div className="card"><div className="table-wrap">
+          <EntityTable cfg={OPS.ticket} items={data.ticket} data={data}
+            onEdit={(item) => setEditing({entity:"ticket", item})}
+            onDelete={(item) => setConfirmDelete({entity:"ticket", id:item.id, label:item.ticketNo||"無番"})} />
+        </div></div>
+      )}
+    </>;
+  }
+  return <>
+    <div className="page-head">
+      <div className="page-title-block">
+        <div className="page-kicker">Operations</div>
+        <h1 className="page-title">問い合わせ・修繕</h1>
+        <div className="page-subtitle">入居者問い合わせと修繕工事の管理</div>
+      </div>
+      <div className="page-actions">
+        <button className="btn btn-primary" onClick={() => setEditing({entity:"repair", item:null})}>＋ 修繕を追加</button>
+      </div>
+    </div>
+    <div className="filter-row">
+      <div className={`chip ${tab==="ticket"?"active":""}`} onClick={() => setTab("ticket")}>問い合わせ<span className="chip-count">{(data.ticket||[]).length}</span></div>
+      <div className={`chip ${tab==="repair"?"active":""}`} onClick={() => setTab("repair")}>修繕履歴<span className="chip-count">{(data.repair||[]).length}</span></div>
+    </div>
+    {(data.repair||[]).length === 0 ? (
+      <div className="card"><div className="empty"><span className="empty-glyph">繕</span>
+        <div className="empty-title">修繕記録がありません</div>
+        <div className="empty-text">右上から修繕を追加できます。</div>
+      </div></div>
+    ) : (
+      <div className="card"><div className="table-wrap">
+        <EntityTable cfg={OPS.repair} items={data.repair} data={data}
+          onEdit={(item) => setEditing({entity:"repair", item})}
+          onDelete={(item) => setConfirmDelete({entity:"repair", id:item.id, label:item.workContent||"修繕"})} />
+      </div></div>
+    )}
+  </>;
+}
+
+/* ==========================================================================
+   Analytics Page
+   ========================================================================== */
+function AnalyticsPage({data}) {
+  const {year, month} = currentYM();
+  // 過去12ヶ月の入金推移
+  const monthlyTrend = useMemo(() => {
+    const arr = [];
+    for(let i = 11; i >= 0; i--) {
+      const d = new Date(year, month - 1 - i, 1);
+      const y = d.getFullYear(), mo = d.getMonth()+1;
+      const billings = (data.billing||[]).filter(b => b.year === y && b.month === mo);
+      const received = billings.reduce((s,b) => s+(Number(b.paidAmount)||0), 0);
+      arr.push({label:`${String(y).slice(2)}/${String(mo).padStart(2,"0")}`, value:received});
+    }
+    return arr;
+  }, [data.billing, year, month]);
+
+  // 業種別修繕費
+  const repairByCategory = useMemo(() => {
+    const map = {};
+    for(const r of data.repair||[]) {
+      const v = data.vendor.find(x => x.id === r.vendorId);
+      const cat = v ? v.category : "未設定";
+      map[cat] = (map[cat] || 0) + (Number(r.cost)||0);
+    }
+    return Object.entries(map).map(([label,value]) => ({label,value})).sort((a,b) => b.value - a.value);
+  }, [data.repair, data.vendor]);
+
+  // チケットステータス内訳
+  const ticketStatus = useMemo(() => {
+    const map = {};
+    OPS.ticket.statuses.forEach(s => map[s] = 0);
+    for(const t of data.ticket||[]) map[t.status] = (map[t.status]||0) + 1;
+    return Object.entries(map).map(([label,value]) => ({label,value}));
+  }, [data.ticket]);
+
+  // 入居率（建物別）
+  const occupancyByBuilding = useMemo(() => {
+    return (data.building||[]).map(b => {
+      const rooms = (data.room||[]).filter(r => r.buildingId === b.id);
+      const occ = rooms.filter(r => r.status === "入居中").length;
+      const rate = rooms.length === 0 ? 0 : Math.round((occ/rooms.length)*100);
+      return {label:b.name, value:rate, total:rooms.length, occupied:occ};
+    }).sort((a,b) => a.value - b.value);
+  }, [data.building, data.room]);
+
+  return (
+    <>
+      <div className="page-head">
+        <div className="page-title-block">
+          <div className="page-kicker">Reports</div>
+          <h1 className="page-title">分析レポート</h1>
+          <div className="page-subtitle">蓄積されたデータを多角的に分析</div>
+        </div>
+      </div>
+
+      <div className="dash-row">
+        <div className="dash-card">
+          <div className="dash-card-title"><span>月次入金推移</span><span className="meta">Past 12 months</span></div>
+          <LineChart data={monthlyTrend} formatY={(v) => "¥"+(v/10000).toFixed(0)+"万"} />
+        </div>
+        <div className="dash-card">
+          <div className="dash-card-title"><span>業種別 修繕費</span><span className="meta">Total cost</span></div>
+          {repairByCategory.length === 0 ? <div className="muted" style={{padding:12, fontSize:12}}>修繕データが必要です</div> : (
+            <BarChart data={repairByCategory} formatY={(v) => "¥"+(v/10000).toFixed(0)+"万"} />
+          )}
+        </div>
+      </div>
+
+      <div className="dash-row">
+        <div className="dash-card">
+          <div className="dash-card-title"><span>建物別入居率</span><span className="meta">Occupancy</span></div>
+          {occupancyByBuilding.length === 0 ? <div className="muted" style={{padding:12, fontSize:12}}>建物データが必要です</div> : (
+            <table className="data" style={{width:"100%"}}><tbody>
+              {occupancyByBuilding.map(b => (
+                <tr key={b.label}>
+                  <td className="primary-cell" style={{maxWidth:160}}>{b.label}<span className="sub">{b.occupied}/{b.total}室</span></td>
+                  <td style={{width:"60%"}}>
+                    <div className="occupancy-bar" style={{height:8, margin:0}}>
+                      <div className="occupancy-seg occupied" style={{width:`${b.value}%`}} />
+                    </div>
+                  </td>
+                  <td className="col-num" style={{width:60, fontWeight:600}}>{b.value}%</td>
+                </tr>
+              ))}
+            </tbody></table>
+          )}
+        </div>
+        <div className="dash-card">
+          <div className="dash-card-title"><span>問い合わせ ステータス内訳</span><span className="meta">Tickets</span></div>
+          {(data.ticket||[]).length === 0 ? <div className="muted" style={{padding:12, fontSize:12}}>チケットデータが必要です</div> : (
+            <BarChart data={ticketStatus} formatY={(v) => v+"件"} />
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+function LineChart({data, formatY = (v)=>v}) {
+  const W = 540, H = 220, P = {t:16, r:14, b:30, l:50};
+  const iw = W - P.l - P.r, ih = H - P.t - P.b;
+  if(!data.length) return <div className="muted" style={{padding:12}}>データなし</div>;
+  const max = Math.max(...data.map(d => d.value), 1);
+  const yScale = (v) => P.t + ih - (v/max)*ih;
+  const xScale = (i) => P.l + (i / Math.max(data.length-1, 1)) * iw;
+  const points = data.map((d,i) => `${xScale(i)},${yScale(d.value)}`).join(" ");
+  const areaPath = `M ${xScale(0)},${P.t+ih} L ${points.split(" ").join(" L ")} L ${xScale(data.length-1)},${P.t+ih} Z`;
+  const ticks = [0, max*0.5, max];
+  return (
+    <div className="chart-wrap">
+      <svg width="100%" height={H} viewBox={`0 0 ${W} ${H}`}>
+        {ticks.map(t => (
+          <g key={t}>
+            <line className="chart-grid" x1={P.l} x2={P.l+iw} y1={yScale(t)} y2={yScale(t)} />
+            <text className="chart-tick" x={P.l-6} y={yScale(t)+3} textAnchor="end">{formatY(t)}</text>
+          </g>
+        ))}
+        <path className="chart-area" d={areaPath} />
+        <polyline className="chart-line" points={points} />
+        {data.map((d,i) => (
+          <g key={i}>
+            <circle cx={xScale(i)} cy={yScale(d.value)} r="3" fill="var(--accent)" />
+            <text className="chart-tick" x={xScale(i)} y={H-P.b+14} textAnchor="middle">{d.label}</text>
+          </g>
+        ))}
+      </svg>
+    </div>
+  );
+}
+
+function BarChart({data, formatY = (v)=>v}) {
+  const W = 540, H = 220, P = {t:16, r:14, b:30, l:70};
+  const iw = W - P.l - P.r, ih = H - P.t - P.b;
+  if(!data.length) return <div className="muted" style={{padding:12}}>データなし</div>;
+  const max = Math.max(...data.map(d => d.value), 1);
+  const barW = iw / data.length * 0.7;
+  const gap = iw / data.length * 0.3;
+  const yScale = (v) => P.t + ih - (v/max)*ih;
+  return (
+    <div className="chart-wrap">
+      <svg width="100%" height={H} viewBox={`0 0 ${W} ${H}`}>
+        <line className="chart-grid" x1={P.l} x2={P.l+iw} y1={P.t+ih} y2={P.t+ih} />
+        <text className="chart-tick" x={P.l-6} y={P.t+3} textAnchor="end">{formatY(max)}</text>
+        <text className="chart-tick" x={P.l-6} y={P.t+ih+3} textAnchor="end">0</text>
+        {data.map((d,i) => {
+          const x = P.l + i*(barW+gap) + gap/2;
+          const y = yScale(d.value);
+          return (
+            <g key={i}>
+              <rect className="chart-bar" x={x} y={y} width={barW} height={Math.max(P.t+ih-y, 0)} />
+              <text className="chart-tick" x={x+barW/2} y={H-P.b+14} textAnchor="middle">{d.label.length > 6 ? d.label.slice(0,5)+"…" : d.label}</text>
+              <text className="chart-tick" x={x+barW/2} y={y-4} textAnchor="middle" style={{fontWeight:600, fill:"var(--ink-2)"}}>{formatY(d.value)}</text>
+            </g>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
+/* ==========================================================================
+   Accounting Export Page
+   ========================================================================== */
+function AccountingExportPage({data}) {
+  const {year, month} = currentYM();
+  const lastDay = new Date(year, month, 0).getDate();
+  const [from, setFrom] = useState(`${year}-${String(month).padStart(2,"0")}-01`);
+  const [to, setTo] = useState(`${year}-${String(month).padStart(2,"0")}-${String(lastDay).padStart(2,"0")}`);
+
+  const entries = useMemo(() => {
+    const out = [];
+    // 入金 (賃料収入)
+    for(const p of data.payment||[]) {
+      if(p.paidDate >= from && p.paidDate <= to) {
+        const billing = data.billing.find(b => b.id === p.billingId);
+        const contractRef = billing ? refLabel(data,"contract",billing.contractId) : "";
+        out.push({
+          date: p.paidDate, debit:"現金預金", credit:"売上高（賃料収入）",
+          amount: Number(p.amount)||0, memo: `${contractRef} ${billing?billing.year:""}/${billing?billing.month:""} 賃料入金`
+        });
+      }
+    }
+    // 支払 (修繕費・管理費)
+    for(const v of data.vendorPayment||[]) {
+      if(v.status !== "支払済" || !v.paidDate) continue;
+      if(v.paidDate >= from && v.paidDate <= to) {
+        const cat = (data.vendor.find(x => x.id === v.vendorId) || {}).category || "";
+        const account = cat === "清掃" ? "清掃費" : (cat === "修繕" || cat.includes("工事")) ? "修繕費" : "外注費";
+        out.push({
+          date: v.paidDate, debit:account, credit:"現金預金",
+          amount: Number(v.amount)||0, memo: `${refLabel(data,"vendor",v.vendorId)} ${v.purpose}`
+        });
+      }
+    }
+    // 送金 (預り金返済)
+    for(const r of data.remittance||[]) {
+      if(r.status !== "送金済" || !r.paidDate) continue;
+      if(r.paidDate >= from && r.paidDate <= to) {
+        out.push({
+          date: r.paidDate, debit:"預り金（家主送金）", credit:"現金預金",
+          amount: Number(r.netAmount)||0, memo: `${refLabel(data,"owner",r.ownerId)} ${r.year}/${r.month} 送金`
+        });
+      }
+    }
+    return out.sort((a,b) => a.date.localeCompare(b.date));
+  }, [data, from, to]);
+
+  const totalAmount = entries.reduce((s,e) => s+e.amount, 0);
+
+  const downloadCSV = () => {
+    const rows = [
+      ["日付","借方","貸方","金額","摘要"],
+      ...entries.map(e => [e.date, e.debit, e.credit, e.amount, e.memo])
+    ];
+    downloadFile(`仕訳_${from}_${to}.csv`, buildCsv(rows), "text/csv;charset=utf-8");
+  };
+
+  return (
+    <>
+      <div className="page-head">
+        <div className="page-title-block">
+          <div className="page-kicker">Reports</div>
+          <h1 className="page-title">仕訳出力</h1>
+          <div className="page-subtitle">入金・支払・送金から仕訳データを自動生成し、CSVで出力</div>
+        </div>
+      </div>
+
+      <div className="banner info">
+        <strong>使い方:</strong> 期間を指定してCSVをダウンロードすると、Excelや会計ソフト（弥生会計、freee会計など）で取り込める形式（日付/借方/貸方/金額/摘要）で出力されます。
+      </div>
+
+      <div className="card">
+        <div className="card-head"><div className="card-head-title">期間指定</div></div>
+        <div className="card-body" style={{display:"flex", gap:16, alignItems:"flex-end", flexWrap:"wrap"}}>
+          <div className="form-field"><label className="form-label">開始日</label><input className="form-input" type="date" value={from} onChange={e => setFrom(e.target.value)} /></div>
+          <div className="form-field"><label className="form-label">終了日</label><input className="form-input" type="date" value={to} onChange={e => setTo(e.target.value)} /></div>
+          <button className="btn btn-primary" onClick={downloadCSV} disabled={entries.length === 0}>CSVをダウンロード</button>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-head">
+          <div className="card-head-title">プレビュー（{entries.length} 件 / 合計 {fmtMoney(totalAmount)}）</div>
+        </div>
+        {entries.length === 0 ? (
+          <div className="empty" style={{padding:40}}>
+            <div className="empty-title">期間内に対象データがありません</div>
+            <div className="empty-text">期間を変更するか、入金/支払/送金データを登録してください。</div>
+          </div>
+        ) : (
+          <div className="table-wrap"><table className="data">
+            <thead><tr><th>日付</th><th>借方</th><th>貸方</th><th>金額</th><th>摘要</th></tr></thead>
+            <tbody>
+              {entries.map((e,i) => (
+                <tr key={i}>
+                  <td className="tabular">{fmtDate(e.date)}</td>
+                  <td>{e.debit}</td>
+                  <td>{e.credit}</td>
+                  <td className="col-num">{fmtMoney(e.amount)}</td>
+                  <td>{e.memo}</td>
+                </tr>
+              ))}
+              <tr className="total-row">
+                <td colSpan={3} style={{textAlign:"right"}}>合計</td>
+                <td className="col-num">{fmtMoney(totalAmount)}</td>
+                <td></td>
+              </tr>
+            </tbody>
+          </table></div>
+        )}
+      </div>
+    </>
+  );
+}
+
+/* ==========================================================================
+   Cashflow Page — 管理会社のキャッシュフロー分析
+   - 既存データ (payment / remittance / vendorPayment / repair) から算出
+   - 月次比較 + 自動分析 (ルールベース)
+   - 将来: Claude API による詳細AI分析、工事業務データ連結
+   ========================================================================== */
+function CashflowPage({data, onSaveAnalysis}) {
+  const cur = currentYM();
+  const [year, setYear] = useState(cur.year);
+  const [month, setMonth] = useState(cur.month);
+
+  // ---- 月別キャッシュフロー算出 (純関数) ----
+  const computeMonth = (y, m) => {
+    const ymStart = `${y}-${String(m).padStart(2,"0")}-01`;
+    const ymEnd   = `${y}-${String(m).padStart(2,"0")}-${String(new Date(y, m, 0).getDate()).padStart(2,"0")}`;
+
+    // 収入: 借主からの入金 (paidDate基準)
+    const paymentsInMonth = (data.payment||[]).filter(p => p.paidDate >= ymStart && p.paidDate <= ymEnd);
+    const incomeTotal = paymentsInMonth.reduce((s,p) => s + (Number(p.amount)||0), 0);
+
+    // 当月の送金記録 (year+month一致)
+    const remitsInMonth = (data.remittance||[]).filter(r => r.year === y && r.month === m);
+    const managementFee = remitsInMonth.reduce((s,r) => s + (Number(r.managementFee)||0), 0);
+    const ownerRemit    = remitsInMonth.reduce((s,r) => s + (Number(r.netAmount)||0), 0);
+    const repairDeductFromOwner = remitsInMonth.reduce((s,r) => s + (Number(r.repairsDeducted)||0), 0);
+
+    // 業者支払 (実施日基準。未払いは含まない)
+    const vendorPaysInMonth = (data.vendorPayment||[]).filter(v => {
+      const d = v.paidDate || v.paymentDate;
+      return d >= ymStart && d <= ymEnd && v.status === "支払済";
+    });
+    const vendorTotal = vendorPaysInMonth.reduce((s,v) => s + (Number(v.amount)||0), 0);
+
+    // 修繕費 — 管理会社負担分のみ (完了日基準)
+    const repairsInMonth = (data.repair||[]).filter(r => r.status === "完了" && r.completionDate >= ymStart && r.completionDate <= ymEnd);
+    const repairMgmtBurden = repairsInMonth.filter(r => r.paidBy === "管理会社負担").reduce((s,r) => s + (Number(r.cost)||0), 0);
+
+    // 工事案件 (paymentDate / subcontractorPaidDate 基準で月次振分)
+    const constructions = data.construction || [];
+    const constructionIncomeProjects = constructions.filter(c =>
+      c.paymentDate && c.paymentDate >= ymStart && c.paymentDate <= ymEnd
+    );
+    const constructionIncome = constructionIncomeProjects.reduce((s,c) => s + (Number(c.paidAmount)||0), 0);
+    const constructionExpenseProjects = constructions.filter(c =>
+      c.subcontractorPaidDate && c.subcontractorPaidDate >= ymStart && c.subcontractorPaidDate <= ymEnd
+    );
+    const constructionExpense = constructionExpenseProjects.reduce((s,c) => s + (Number(c.subcontractorCost)||0), 0);
+    const constructionGross = constructionIncome - constructionExpense;
+    const activeProjects = constructions.filter(c =>
+      ["受注","施工中","完了"].includes(c.status) &&
+      (!c.completionDate || c.completionDate >= ymStart) // 当月までに完了しているか進行中
+    );
+    const completedThisMonth = constructions.filter(c =>
+      c.completionDate && c.completionDate >= ymStart && c.completionDate <= ymEnd
+    );
+
+    // 純利益 (賃貸+工事の合算)
+    const rentalNet = managementFee - vendorTotal - repairMgmtBurden;
+    const totalExpense = vendorTotal + repairMgmtBurden;
+    const totalGroupIncome = managementFee + constructionIncome;
+    const totalGroupExpense = totalExpense + constructionExpense;
+    const totalGroupNet = totalGroupIncome - totalGroupExpense;
+    const netProfit = rentalNet; // 互換: 賃貸事業単体の純利益 (既存ロジック)
+
+    return {
+      year:y, month:m,
+      income: incomeTotal,
+      managementFee,
+      ownerRemit,
+      vendorTotal,
+      repairMgmtBurden,
+      totalExpense,
+      netProfit,
+      // 工事案件
+      constructionIncome,
+      constructionExpense,
+      constructionGross,
+      constructionIncomeProjects,
+      constructionExpenseProjects,
+      activeProjects,
+      completedThisMonth,
+      // 全社合算
+      totalGroupIncome,
+      totalGroupExpense,
+      totalGroupNet,
+      // 詳細データ
+      payments: paymentsInMonth,
+      remits: remitsInMonth,
+      vendorPays: vendorPaysInMonth,
+      repairs: repairsInMonth,
+    };
+  };
+
+  const current = useMemo(() => computeMonth(year, month), [data, year, month]);
+  const prevYM = useMemo(() => {
+    const prevMonth = month === 1 ? 12 : month - 1;
+    const prevYear  = month === 1 ? year - 1 : year;
+    return {year: prevYear, month: prevMonth};
+  }, [year, month]);
+  const previous = useMemo(() => computeMonth(prevYM.year, prevYM.month), [data, prevYM]);
+
+  // 6ヶ月分の月次推移
+  const last6 = useMemo(() => {
+    const arr = [];
+    for(let i = 5; i >= 0; i--) {
+      const d = new Date(year, month - 1 - i, 1);
+      arr.push(computeMonth(d.getFullYear(), d.getMonth() + 1));
+    }
+    return arr;
+  }, [data, year, month]);
+
+  // ---- 自動分析 (ルールベース) ----
+  const insights = useMemo(() => {
+    const r = [];
+    const fmtPct = (a, b) => b === 0 ? (a > 0 ? "+∞%" : "—") : `${a-b>=0?"+":""}${(((a-b)/Math.abs(b))*100).toFixed(1)}%`;
+
+    // 1. 純利益サマリ
+    const dProfit = current.netProfit - previous.netProfit;
+    r.push({
+      kind: dProfit >= 0 ? "positive" : "warning",
+      icon: dProfit >= 0 ? "▲" : "▼",
+      title: "純利益",
+      text: `今月の純利益は ${fmtMoney(current.netProfit)} (前月比 ${dProfit>=0?"+":""}${fmtMoney(dProfit)}、${fmtPct(current.netProfit, previous.netProfit)})`,
+    });
+
+    // 2. 入金変動
+    if(previous.income > 0) {
+      const dIncome = current.income - previous.income;
+      const pctIncome = (dIncome/previous.income)*100;
+      if(Math.abs(pctIncome) >= 3) {
+        r.push({
+          kind: dIncome >= 0 ? "positive" : "warning",
+          icon: dIncome >= 0 ? "↑" : "↓",
+          title: "入金",
+          text: `入金合計は ${fmtMoney(current.income)}、前月比 ${fmtPct(current.income, previous.income)}` +
+                (Math.abs(pctIncome) >= 10 ? "。要因の確認を推奨" : ""),
+        });
+      }
+    }
+
+    // 3. 支出カテゴリの変動分析 - 「なぜ支出が大きくなったか」の核心
+    const categories = [
+      { name: "業者支払",         cur: current.vendorTotal,      prev: previous.vendorTotal },
+      { name: "修繕費(管理会社負担)", cur: current.repairMgmtBurden, prev: previous.repairMgmtBurden },
+    ];
+    for(const c of categories) {
+      const d = c.cur - c.prev;
+      if(c.prev === 0 && c.cur > 0) {
+        r.push({ kind:"warning", icon:"!", title:c.name, text:`${c.name}が ${fmtMoney(c.cur)} 発生 (前月は¥0)。要因確認推奨。` });
+      } else if(c.prev > 0 && Math.abs(d) > 50000 && Math.abs(d/c.prev*100) >= 15) {
+        r.push({
+          kind: d > 0 ? "warning" : "positive",
+          icon: d > 0 ? "↑" : "↓",
+          title: c.name,
+          text: `${c.name}は ${fmtMoney(c.cur)}、前月比 ${d>=0?"+":""}${fmtMoney(d)} (${fmtPct(c.cur, c.prev)})`,
+        });
+      }
+    }
+
+    // 4. 大口業者支払の特定 - 「なぜ?」に答える具体的取引
+    if(current.vendorPays.length > 0) {
+      const sortedV = [...current.vendorPays].sort((a,b) => (b.amount||0) - (a.amount||0));
+      const top = sortedV[0];
+      const vendorName = (data.vendor||[]).find(v => v.id === top.vendorId)?.name || "業者不明";
+      if((top.amount||0) >= 100000) {
+        r.push({
+          kind: "info",
+          icon: "$",
+          title: "大口支払",
+          text: `今月最大の業者支払は ${vendorName} への ${fmtMoney(top.amount)} (内容: ${top.purpose||"-"})`,
+        });
+      }
+      // 業者集中度
+      const totalAmt = current.vendorPays.reduce((s,p)=>s+(Number(p.amount)||0),0);
+      if(totalAmt > 0) {
+        const top2Amt = sortedV.slice(0,2).reduce((s,p)=>s+(Number(p.amount)||0),0);
+        const concentration = (top2Amt/totalAmt)*100;
+        if(concentration >= 70 && current.vendorPays.length >= 3) {
+          r.push({
+            kind: "info",
+            icon: "◆",
+            title: "業者集中",
+            text: `業者支払の${concentration.toFixed(0)}%が上位2社に集中。リスク分散を検討`,
+          });
+        }
+      }
+    }
+
+    // 5. 大口修繕の特定
+    if(current.repairs.length > 0) {
+      const mgmtRepairs = current.repairs.filter(r => r.paidBy === "管理会社負担");
+      if(mgmtRepairs.length > 0) {
+        const sortedR = [...mgmtRepairs].sort((a,b) => (b.cost||0) - (a.cost||0));
+        const top = sortedR[0];
+        const bldName = (data.building||[]).find(b => b.id === top.buildingId)?.name || "物件不明";
+        if((top.cost||0) >= 50000) {
+          r.push({
+            kind: "info",
+            icon: "🔧",
+            title: "大口修繕",
+            text: `管理会社負担の最大修繕: ${bldName} の ${top.workContent||"-"} ${fmtMoney(top.cost)}`,
+          });
+        }
+      }
+    }
+
+    // 6. 利益率の評価
+    if(current.income > 0) {
+      const profitMargin = (current.netProfit / current.income) * 100;
+      const prevMargin = previous.income > 0 ? (previous.netProfit / previous.income) * 100 : 0;
+      const dMargin = profitMargin - prevMargin;
+      r.push({
+        kind: profitMargin > 5 ? "positive" : profitMargin < 0 ? "warning" : "info",
+        icon: "%",
+        title: "利益率",
+        text: `純利益率は ${profitMargin.toFixed(1)}%${previous.income > 0 ? ` (前月 ${prevMargin.toFixed(1)}%、${dMargin>=0?"+":""}${dMargin.toFixed(1)}pt)` : ""}`,
+      });
+    }
+
+    // 7. 工事業務 - 連結された場合のみ
+    if(current.activeProjects.length > 0 || current.constructionIncome > 0 || current.constructionExpense > 0) {
+      // 工事粗利
+      r.push({
+        kind: current.constructionGross >= 0 ? "positive" : "warning",
+        icon: "🏗",
+        title: "工事粗利",
+        text: `工事事業は粗利 ${fmtMoney(current.constructionGross)} (収入 ${fmtMoney(current.constructionIncome)} - 外注費 ${fmtMoney(current.constructionExpense)})`
+      });
+      // 進行中案件
+      if(current.activeProjects.length > 0) {
+        const totalContractValue = current.activeProjects.reduce((s,c)=>s+(Number(c.contractAmount)||0),0);
+        r.push({
+          kind: "info",
+          icon: "📋",
+          title: "進行中工事",
+          text: `${current.activeProjects.length}件進行中 (受注額合計 ${fmtMoney(totalContractValue)})`
+        });
+      }
+      // 当月完了
+      if(current.completedThisMonth.length > 0) {
+        const completed = current.completedThisMonth.reduce((s,c)=>s+(Number(c.contractAmount)||0),0);
+        r.push({
+          kind: "positive",
+          icon: "✓",
+          title: "今月完了工事",
+          text: `${current.completedThisMonth.length}件完了 (受注額合計 ${fmtMoney(completed)})`
+        });
+      }
+      // 全社業績
+      r.push({
+        kind: current.totalGroupNet >= 0 ? "positive" : "warning",
+        icon: "Σ",
+        title: "全社業績",
+        text: `賃貸+工事の合算純利益は ${fmtMoney(current.totalGroupNet)} (賃貸 ${fmtMoney(current.netProfit)} + 工事粗利 ${fmtMoney(current.constructionGross)})`
+      });
+    }
+
+    if(r.length === 0) {
+      r.push({ kind:"info", icon:"i", title:"分析", text:"データが少ないため、月次比較を生成できません。"});
+    }
+    return r;
+  }, [current, previous, data]);
+
+  // ---- Claude AI 分析用プロンプト生成 ----
+  // クロスエンティティ統計と過去学習コンテキストを含めることで、
+  // AIが全データの関連性を発見し、過去のフィードバックを踏まえた精度向上を行う
+  const aiPrompt = useMemo(() => {
+    const fmtY = (n) => `¥${Number(n||0).toLocaleString("ja-JP")}`;
+    const L = [];
+    L.push(`あなたは賃貸管理会社の経営分析を担当するファイナンシャル・コンサルタントです。`);
+    L.push(`以下の全社データを分析し、データ間の関連性を発見しながら経営者向けレポートを作成してください。`);
+    L.push(``);
+    L.push(`# 分析対象期間: ${fmtYM(year, month)}`);
+    L.push(``);
+    // 学習コンテキスト (過去レビュー済み分析がある場合)
+    const learningCtx = buildLearningContext(data.aiAnalysis || []);
+    if(learningCtx) {
+      L.push(learningCtx);
+      L.push(``);
+    }
+    // 当月キャッシュフロー
+    L.push(`## 当月キャッシュフロー (賃貸事業)`);
+    L.push(`- 借主からの入金: ${fmtY(current.income)}`);
+    L.push(`- 管理手数料収入: ${fmtY(current.managementFee)}`);
+    L.push(`- 家主送金 (素通し): ${fmtY(current.ownerRemit)}`);
+    L.push(`- 業者支払 (管理会社負担): ${fmtY(current.vendorTotal)}`);
+    L.push(`- 修繕費 (管理会社負担): ${fmtY(current.repairMgmtBurden)}`);
+    L.push(`- 賃貸事業の純利益: ${fmtY(current.netProfit)}`);
+    L.push(``);
+    L.push(`## 前月キャッシュフロー (${fmtYM(prevYM.year, prevYM.month)})`);
+    L.push(`- 借主からの入金: ${fmtY(previous.income)}`);
+    L.push(`- 管理手数料収入: ${fmtY(previous.managementFee)}`);
+    L.push(`- 業者支払: ${fmtY(previous.vendorTotal)}`);
+    L.push(`- 修繕費 (管理会社負担): ${fmtY(previous.repairMgmtBurden)}`);
+    L.push(`- 純利益: ${fmtY(previous.netProfit)}`);
+    L.push(``);
+    // 当月の具体取引
+    if(current.vendorPays.length > 0) {
+      L.push(`## 当月の主要業者支払 (上位5件)`);
+      const top5V = [...current.vendorPays].sort((a,b) => (b.amount||0) - (a.amount||0)).slice(0,5);
+      top5V.forEach(v => {
+        const vname = (data.vendor||[]).find(x => x.id === v.vendorId)?.name || "業者不明";
+        L.push(`- ${vname}: ${fmtY(v.amount)} — ${v.purpose||"-"}`);
+      });
+      L.push(``);
+    }
+    const mgmtRepairs = current.repairs.filter(r => r.paidBy === "管理会社負担");
+    if(mgmtRepairs.length > 0) {
+      L.push(`## 当月の修繕 (管理会社負担分)`);
+      mgmtRepairs.forEach(r => {
+        const bld = (data.building||[]).find(b => b.id === r.buildingId)?.name || "物件不明";
+        L.push(`- ${bld}: ${r.workContent||"-"} ${fmtY(r.cost)}`);
+      });
+      L.push(``);
+    }
+    // 6ヶ月推移
+    L.push(`## 直近6ヶ月推移 (賃貸事業の純利益)`);
+    last6.forEach(m => L.push(`- ${m.year}年${m.month}月: ${fmtY(m.netProfit)}`));
+    L.push(``);
+    // 全エンティティ統計 - クロスデータ関連性分析の素材
+    L.push(`## 全社データ統計 (関連性発見のための素材)`);
+    L.push(buildCrossEntityStats(data));
+    L.push(``);
+    // 自動検出インサイト
+    if(insights.length > 0) {
+      L.push(`## システムが検出した注目ポイント (ルールベース)`);
+      insights.forEach(i => L.push(`- [${i.title}] ${i.text}`));
+      L.push(``);
+    }
+    // 分析依頼
+    L.push(`## 分析依頼`);
+    L.push(`以下の構成で経営者向けレポートを作成してください:`);
+    L.push(``);
+    L.push(`1. **総評** — 当月の経営状況を3行以内で簡潔に`);
+    L.push(`2. **支出変動の根本原因分析** — なぜ支出が変動したか、具体的な数字と業者名・物件名を引用`);
+    L.push(`3. **データ間の関連性・相関** — 異なるデータ(家主・建物・業者・修繕・契約 等)を横断して見えてくる関連性や傾向。例: 「業者Aの取引集中と特定物件の修繕件数増加に相関」「申込急増と空室率改善の連動」など`);
+    L.push(`4. **改善提案 (3つ)** — 具体的で実行可能なアクション。各提案にはコストインパクトと実施難度を併記`);
+    L.push(`5. **リスク** — 業者集中・空室・契約満了等の潜在リスク`);
+    L.push(`6. **来月への注意点** — 季節要因や継続案件を踏まえた予測`);
+    L.push(``);
+    L.push(`経営者が読んで即座に次の打ち手を判断できるレポートにしてください。`);
+    L.push(`専門用語は使わず、具体的な金額・業者名・物件名で語ってください。`);
+    L.push(`Markdown形式 (## や - を使用) で構造化してください。`);
+    return L.join("\n");
+  }, [current, previous, last6, insights, year, month, prevYM, data]);
+
+  // ---- 当月の保存済み分析 ----
+  const monthAnalyses = useMemo(() => {
+    return (data.aiAnalysis||[]).filter(a => a.periodYear === year && a.periodMonth === month)
+      .sort((a,b) => (b.createdAt||"").localeCompare(a.createdAt||""));
+  }, [data.aiAnalysis, year, month]);
+
+  const latestAnalysis = monthAnalyses[0] || null;
+
+  // ---- AI分析実行状態 ----
+  const [aiState, setAiState] = useState("idle"); // idle | running | success | error
+  const [aiError, setAiError] = useState(null);
+  const [currentResult, setCurrentResult] = useState(null);
+  const [showPromptModal, setShowPromptModal] = useState(false);
+
+  // ---- API実行 ----
+  const runAiAnalysis = async () => {
+    const settings = data.settings || {};
+    if(!settings.aiEnabled || !settings.aiApiKey) {
+      setAiState("error");
+      setAiError("AI連携が未設定です。設定 → AI連携 から APIキーを登録し、有効化してください。");
+      return;
+    }
+    setAiState("running");
+    setAiError(null);
+    try {
+      const startTime = Date.now();
+      const result = await callClaudeApi(aiPrompt, settings);
+      const elapsedMs = Date.now() - startTime;
+      // 保存用エンティティを作成
+      const analysisItem = {
+        id: `ai_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
+        type: "cashflow_monthly",
+        periodYear: year,
+        periodMonth: month,
+        createdAt: new Date().toISOString(),
+        model: result.model,
+        prompt: aiPrompt,
+        response: result.text,
+        usage: result.usage,
+        elapsedMs,
+        // 学習用フィールド (初期値)
+        reviewStatus: "pending",
+        rating: null,
+        reviewerComment: "",
+        corrections: "",
+        reviewedAt: null,
+      };
+      // 永続化
+      if(onSaveAnalysis) onSaveAnalysis(analysisItem);
+      setCurrentResult(analysisItem);
+      setAiState("success");
+    } catch(e) {
+      console.error("[AI分析] 失敗:", e);
+      setAiError(e.message || String(e));
+      setAiState("error");
+    }
+  };
+
+  // ---- フィードバック更新 ----
+  const updateAnalysisFeedback = (analysis, patch) => {
+    const updated = { ...analysis, ...patch, reviewedAt: new Date().toISOString() };
+    if(patch.rating != null || patch.reviewerComment || patch.corrections) {
+      updated.reviewStatus = "reviewed";
+    }
+    if(onSaveAnalysis) onSaveAnalysis(updated);
+    if(currentResult?.id === analysis.id) setCurrentResult(updated);
+  };
+
+  // ---- フィードバックUI内部状態 ----
+  const [feedbackOpen, setFeedbackOpen] = useState(null); // analysisId
+  const [feedbackRating, setFeedbackRating] = useState(0);
+  const [feedbackComment, setFeedbackComment] = useState("");
+  const [feedbackCorrection, setFeedbackCorrection] = useState("");
+
+  const openFeedback = (analysis) => {
+    setFeedbackOpen(analysis.id);
+    setFeedbackRating(analysis.rating || 0);
+    setFeedbackComment(analysis.reviewerComment || "");
+    setFeedbackCorrection(analysis.corrections || "");
+  };
+  const submitFeedback = (analysis) => {
+    updateAnalysisFeedback(analysis, {
+      rating: feedbackRating || null,
+      reviewerComment: feedbackComment,
+      corrections: feedbackCorrection,
+    });
+    setFeedbackOpen(null);
+  };
+
+  // ---- 大口取引一覧 (今月、収入/支出別) ----
+  const topTransactions = useMemo(() => {
+    const all = [];
+    current.payments.forEach(p => {
+      const billing = (data.billing||[]).find(b => b.id === p.billingId);
+      const contract = billing ? (data.contract||[]).find(c => c.id === billing.contractId) : null;
+      all.push({ kind:"income", date:p.paidDate, label:`入金: ${contract?.tenantName||"-"}`, amount: Number(p.amount)||0 });
+    });
+    current.vendorPays.forEach(v => {
+      const vendor = (data.vendor||[]).find(x => x.id === v.vendorId)?.name || "業者";
+      all.push({ kind:"expense", date:v.paidDate||v.paymentDate, label:`業者支払: ${vendor} (${v.purpose||"-"})`, amount: Number(v.amount)||0 });
+    });
+    current.repairs.filter(r => r.paidBy === "管理会社負担").forEach(r => {
+      const bld = (data.building||[]).find(b => b.id === r.buildingId)?.name || "物件";
+      all.push({ kind:"expense", date:r.completionDate, label:`修繕(管理会社負担): ${bld} ${r.workContent||""}`, amount: Number(r.cost)||0 });
+    });
+    return all.sort((a,b) => b.amount - a.amount).slice(0, 8);
+  }, [current, data]);
+
+  const fmtMoneyShort = (n) => {
+    if(n==null||isNaN(Number(n))) return "—";
+    const v = Number(n);
+    if(Math.abs(v) >= 100000000) return `¥${(v/100000000).toFixed(2)}億`;
+    if(Math.abs(v) >= 10000) return `¥${(v/10000).toFixed(0).replace(/(\d)(?=(\d{3})+$)/g,'$1,')}万`;
+    return fmtMoney(v);
+  };
+
+  const monthOptions = [];
+  for(let yy = cur.year - 1; yy <= cur.year + 1; yy++) {
+    for(let mm = 1; mm <= 12; mm++) monthOptions.push({yy, mm});
+  }
+
+  return (
+    <>
+      <div className="page-head">
+        <div className="page-title-block">
+          <div className="page-kicker">Cash Flow</div>
+          <div className="page-title">キャッシュフロー</div>
+          <div className="page-subtitle">{fmtYM(year, month)} の収支と自動分析</div>
+        </div>
+        <div className="page-actions">
+          <select className="form-select" style={{padding:"7px 10px", fontSize:13}}
+                  value={`${year}-${month}`}
+                  onChange={(e) => { const [y,m] = e.target.value.split("-").map(Number); setYear(y); setMonth(m); }}>
+            {monthOptions.map(o => <option key={`${o.yy}-${o.mm}`} value={`${o.yy}-${o.mm}`}>{fmtYM(o.yy, o.mm)}</option>)}
+          </select>
+        </div>
+      </div>
+
+      {/* ====== KPI ====== */}
+      <div className="stat-grid">
+        <Stat label="今月の入金" value={current.income} format="money" meta={`${current.payments.length}件`} />
+        <Stat label="管理手数料" value={current.managementFee} format="money" className="success"
+              meta={previous.managementFee > 0 ? `前月比 ${((current.managementFee - previous.managementFee)/previous.managementFee*100).toFixed(1)}%` : "—"} />
+        <Stat label="今月の支出 (管理会社負担)" value={current.totalExpense} format="money" className={current.totalExpense > previous.totalExpense ? "warn" : ""}
+              meta={`業者支払 ${fmtMoneyShort(current.vendorTotal)} + 修繕 ${fmtMoneyShort(current.repairMgmtBurden)}`} />
+        <Stat label="純利益" value={current.netProfit} format="money" className={current.netProfit >= 0 ? "success" : "warn"}
+              meta={previous.netProfit !== 0 ? `前月比 ${current.netProfit - previous.netProfit >= 0 ? "+" : ""}${fmtMoneyShort(current.netProfit - previous.netProfit)}` : "—"} />
+      </div>
+
+      {/* ====== 自動分析レポート ====== */}
+      <div className="card">
+        <div className="card-head">
+          <div className="card-head-title">📊 自動分析レポート <span className="muted" style={{fontWeight:500, fontSize:11, marginLeft:8}}>ルールベース / {fmtYM(year, month)}</span></div>
+        </div>
+        <div className="card-body" style={{padding:"4px 20px"}}>
+          {insights.map((ins, i) => (
+            <div key={i} style={{
+              display:"flex", gap:12, padding:"12px 0",
+              borderBottom: i < insights.length-1 ? "1px solid var(--border)" : "none",
+              alignItems:"flex-start"
+            }}>
+              <div style={{
+                minWidth:32, height:32, borderRadius:8,
+                display:"flex", alignItems:"center", justifyContent:"center",
+                fontWeight:700, fontSize:14,
+                background: ins.kind === "positive" ? "var(--success-soft)" : ins.kind === "warning" ? "var(--warning-soft)" : "var(--accent-soft)",
+                color:      ins.kind === "positive" ? "var(--success)"      : ins.kind === "warning" ? "var(--warning)"      : "var(--accent)",
+                flexShrink:0
+              }}>{ins.icon}</div>
+              <div style={{flex:1}}>
+                <div style={{fontWeight:700, fontSize:13, marginBottom:2}}>{ins.title}</div>
+                <div style={{fontSize:13, color:"var(--ink-2)", lineHeight:1.6}}>{ins.text}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* ====== AI詳細分析 (Claude API 直結 / 学習機能つき) ====== */}
+      <div className="card" style={{marginTop:16, borderColor:"var(--accent-border)", background:"linear-gradient(135deg, var(--surface) 0%, var(--accent-soft) 100%)"}}>
+        <div className="card-head" style={{borderBottom:"none", background:"transparent"}}>
+          <div className="card-head-title">
+            ⚡ Claude AI 経営分析
+            <span style={{fontSize:11, fontWeight:600, color:"var(--muted)", marginLeft:10}}>
+              {data.settings?.aiEnabled
+                ? `モード: ${data.settings.aiAuthMode === "gateway" ? "BMS Gateway 経由" : "Anthropic 直結"} / モデル: ${data.settings.aiModel}`
+                : "未設定 (設定 → AI連携 でAPIキー登録が必要)"}
+            </span>
+          </div>
+        </div>
+        <div className="card-body">
+          <div style={{fontSize:13, color:"var(--ink-2)", lineHeight:1.7, marginBottom:12}}>
+            賃貸・契約・業者・修繕・工事案件を含む<strong>全データの関連性</strong>から、根本原因と改善提案を自然言語で生成します。
+            過去のレビュー結果が次回分析に学習として反映されます。
+          </div>
+          <div style={{display:"flex", gap:10, alignItems:"center", flexWrap:"wrap"}}>
+            <button className="btn btn-primary" onClick={runAiAnalysis} disabled={aiState === "running" || !data.settings?.aiEnabled}>
+              {aiState === "running" ? "⏳ 分析中... (10〜30秒)" :
+               aiState === "success" ? "🔄 再実行" :
+                                       "⚡ AI分析を実行"}
+            </button>
+            <button className="btn btn-ghost btn-sm" onClick={() => setShowPromptModal(true)}>
+              送信プロンプトを確認
+            </button>
+            <span className="muted" style={{fontSize:11}}>
+              プロンプト全長: 約{Math.round(aiPrompt.length/100)*100}文字
+              {monthAnalyses.length > 0 && ` / 当月実施回数: ${monthAnalyses.length}回`}
+            </span>
+          </div>
+          {aiState === "error" && aiError && (
+            <div style={{marginTop:12, padding:"10px 12px", background:"var(--danger-soft)", border:"1px solid var(--danger-border)", borderRadius:8, fontSize:12, color:"var(--danger)"}}>
+              ⚠ {aiError}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ====== AI分析結果表示 + フィードバックUI ====== */}
+      {(currentResult || latestAnalysis) && (() => {
+        const target = currentResult || latestAnalysis;
+        const isReviewing = feedbackOpen === target.id;
+        return (
+          <div className="card" style={{marginTop:16}}>
+            <div className="card-head">
+              <div className="card-head-title">
+                💬 AI分析レポート
+                <span style={{fontSize:11, fontWeight:500, color:"var(--muted)", marginLeft:10}}>
+                  実施: {fmtDateTime(target.createdAt)} / {target.model}
+                  {target.usage?.input_tokens && ` / トークン入${target.usage.input_tokens} 出${target.usage.output_tokens}`}
+                </span>
+              </div>
+              <div>
+                {target.reviewStatus === "reviewed" ? (
+                  <span className="badge badge-success">★{target.rating || "-"} レビュー済</span>
+                ) : (
+                  <span className="badge badge-warning">未レビュー</span>
+                )}
+              </div>
+            </div>
+            <div className="card-body">
+              <div style={{padding:"6px 0", fontSize:13, color:"var(--ink-2)"}}>
+                {renderMarkdown(target.response)}
+              </div>
+
+              {/* フィードバックセクション */}
+              <div style={{marginTop:20, paddingTop:16, borderTop:"1px solid var(--border)"}}>
+                {!isReviewing ? (
+                  <div style={{display:"flex", alignItems:"center", gap:12, flexWrap:"wrap"}}>
+                    <div style={{fontSize:13, fontWeight:600}}>
+                      {target.reviewStatus === "reviewed" ? "📋 あなたのレビュー" : "💡 この分析を評価して、AIの学習データに加える"}
+                    </div>
+                    {target.reviewStatus === "reviewed" && (
+                      <>
+                        <span style={{color:"var(--warning)", fontSize:16}}>{"★".repeat(target.rating || 0)}{"☆".repeat(5-(target.rating||0))}</span>
+                        {target.reviewerComment && <span style={{fontSize:12, color:"var(--muted)"}}>"{target.reviewerComment.slice(0,60)}{target.reviewerComment.length>60?"…":""}"</span>}
+                      </>
+                    )}
+                    <button className="btn btn-sm" onClick={() => openFeedback(target)}>
+                      {target.reviewStatus === "reviewed" ? "レビューを更新" : "レビューする"}
+                    </button>
+                  </div>
+                ) : (
+                  <div>
+                    <div style={{fontWeight:600, marginBottom:8, fontSize:13}}>この分析の評価</div>
+                    <div style={{display:"flex", gap:4, marginBottom:14, alignItems:"center"}}>
+                      {[1,2,3,4,5].map(n => (
+                        <button key={n} onClick={() => setFeedbackRating(n)}
+                                style={{background:"transparent", border:"none", cursor:"pointer", fontSize:24, padding:"0 2px",
+                                        color: feedbackRating >= n ? "var(--warning)" : "var(--border-strong)"}}
+                                title={["とても不正確","不正確","普通","正確","非常に正確"][n-1]}>★</button>
+                      ))}
+                      <span style={{marginLeft:10, fontSize:12, color:"var(--muted)"}}>
+                        {feedbackRating === 0 ? "未評価" :
+                         feedbackRating === 1 ? "とても不正確" :
+                         feedbackRating === 2 ? "不正確" :
+                         feedbackRating === 3 ? "普通" :
+                         feedbackRating === 4 ? "正確で有用" : "非常に正確で実用的"}
+                      </span>
+                    </div>
+
+                    <div className="form-field full" style={{marginBottom:12}}>
+                      <label className="form-label">訂正・補足 (AIの間違いや改善点を具体的に)</label>
+                      <textarea className="form-textarea" rows="3"
+                                value={feedbackCorrection}
+                                onChange={(e) => setFeedbackCorrection(e.target.value)}
+                                placeholder="例: 業者集中の指摘は正確だったが、改善提案の『契約更新時期にあわせ業者切替』は実務的に困難。理由は…" />
+                      <div className="form-help">次回分析時にこの訂正が文脈として使われ、AIが同じ間違いを繰り返さないようになります。</div>
+                    </div>
+
+                    <div className="form-field full" style={{marginBottom:12}}>
+                      <label className="form-label">コメント (どう活用したか・所感)</label>
+                      <textarea className="form-textarea" rows="2"
+                                value={feedbackComment}
+                                onChange={(e) => setFeedbackComment(e.target.value)}
+                                placeholder="例: 業者集中の警告で取引先見直しを開始。来月の数字で効果検証する。" />
+                    </div>
+
+                    <div style={{display:"flex", gap:8}}>
+                      <button className="btn btn-primary" onClick={() => submitFeedback(target)}>
+                        フィードバックを保存
+                      </button>
+                      <button className="btn" onClick={() => setFeedbackOpen(null)}>
+                        キャンセル
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ====== 過去のAI分析履歴 (当月以外) ====== */}
+      {(() => {
+        const others = (data.aiAnalysis||[])
+          .filter(a => !(a.periodYear === year && a.periodMonth === month))
+          .sort((a,b) => (b.createdAt||"").localeCompare(a.createdAt||""))
+          .slice(0, 12);
+        if(others.length === 0) return null;
+        return (
+          <div className="card" style={{marginTop:16}}>
+            <div className="card-head">
+              <div className="card-head-title">
+                📚 過去のAI分析履歴 <span className="muted" style={{fontWeight:500, fontSize:11, marginLeft:8}}>直近{others.length}件 (学習データとして使用)</span>
+              </div>
+            </div>
+            <div className="table-wrap">
+              <table className="data">
+                <thead><tr><th>実施日時</th><th>対象月</th><th>評価</th><th>状態</th><th>レポート冒頭</th><th></th></tr></thead>
+                <tbody>
+                  {others.map(a => (
+                    <tr key={a.id}>
+                      <td style={{fontSize:12, fontFamily:"var(--font-num)"}}>{fmtDateTime(a.createdAt)}</td>
+                      <td className="primary-cell">{fmtYM(a.periodYear, a.periodMonth)}</td>
+                      <td>
+                        {a.rating ?
+                          <span style={{color:"var(--warning)", fontSize:13}}>{"★".repeat(a.rating)}{"☆".repeat(5-a.rating)}</span> :
+                          <span className="muted">未評価</span>}
+                      </td>
+                      <td>
+                        {a.reviewStatus === "reviewed" ?
+                          <span className="badge badge-success">レビュー済</span> :
+                          <span className="badge badge-warning">未レビュー</span>}
+                      </td>
+                      <td style={{fontSize:12, color:"var(--muted)", maxWidth:300}}>
+                        {(a.response||"").slice(0,80)}{(a.response||"").length > 80 ? "…" : ""}
+                      </td>
+                      <td><button className="btn btn-sm btn-ghost" onClick={() => { setCurrentResult(a); window.scrollTo({top:0, behavior:"smooth"}); }}>表示</button></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ====== 送信プロンプト確認モーダル ====== */}
+      {showPromptModal && (
+        <div className="modal-backdrop" onClick={() => setShowPromptModal(false)}>
+          <div className="modal lg" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <div>
+                <div className="modal-kicker">AI Prompt</div>
+                <div className="modal-title">Claude API へ送信するプロンプト全文</div>
+              </div>
+              <button className="modal-close" onClick={() => setShowPromptModal(false)}>×</button>
+            </div>
+            <div className="modal-body">
+              <div style={{marginBottom:10, fontSize:12, color:"var(--muted)"}}>
+                このテキストが API へ送信されます。プロンプトには当月キャッシュフロー・全エンティティ統計・過去のレビュー履歴が含まれます。
+              </div>
+              <textarea readOnly value={aiPrompt}
+                style={{width:"100%", minHeight:400, padding:14,
+                        fontFamily:"ui-monospace, 'Menlo', 'Consolas', monospace", fontSize:11, lineHeight:1.5,
+                        border:"1px solid var(--border)", borderRadius:8, background:"var(--surface-2)",
+                        color:"var(--ink-2)", resize:"vertical"}}
+                onClick={(e) => e.target.select()} />
+            </div>
+            <div className="modal-foot">
+              <button className="btn" onClick={() => setShowPromptModal(false)}>閉じる</button>
+              <button className="btn btn-primary" onClick={async () => {
+                try { await navigator.clipboard.writeText(aiPrompt); }
+                catch {}
+                setShowPromptModal(false);
+              }}>クリップボードにコピー</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ====== 月次推移チャート ====== */}
+      <div className="dash-row" style={{marginTop:16}}>
+        <div className="dash-card" style={{gridColumn:"1 / -1"}}>
+          <div className="dash-card-title">月次推移 (直近6ヶ月)</div>
+          <div className="chart-wrap">
+            <svg width="100%" height="260" viewBox="0 0 720 260">
+              {(() => {
+                const maxV = Math.max(...last6.flatMap(m => [m.income, m.totalExpense, Math.abs(m.netProfit)]), 1);
+                const P = {t:20, r:20, b:40, l:80};
+                const W = 720, H = 260;
+                const iw = W - P.l - P.r, ih = H - P.t - P.b;
+                const groupW = iw / last6.length;
+                const barW = groupW * 0.22;
+                const yScale = (v) => P.t + ih - (v/maxV)*ih;
+                return (
+                  <>
+                    <line x1={P.l} x2={P.l+iw} y1={P.t+ih} y2={P.t+ih} className="chart-grid" />
+                    <text className="chart-tick" x={P.l-8} y={P.t+4} textAnchor="end">{fmtMoneyShort(maxV)}</text>
+                    <text className="chart-tick" x={P.l-8} y={P.t+ih+4} textAnchor="end">0</text>
+                    {last6.map((m,i) => {
+                      const cx = P.l + i*groupW + groupW/2;
+                      return (
+                        <g key={i}>
+                          <rect x={cx - barW*1.6} y={yScale(m.income)} width={barW} height={Math.max(P.t+ih-yScale(m.income),0)} fill="var(--accent)" rx="2" />
+                          <rect x={cx - barW*0.5} y={yScale(m.totalExpense)} width={barW} height={Math.max(P.t+ih-yScale(m.totalExpense),0)} fill="var(--warning)" rx="2" />
+                          <rect x={cx + barW*0.6} y={yScale(Math.abs(m.netProfit))} width={barW} height={Math.max(P.t+ih-yScale(Math.abs(m.netProfit)),0)} fill={m.netProfit >= 0 ? "var(--success)" : "var(--danger)"} rx="2" />
+                          <text className="chart-tick" x={cx} y={H-P.b+14} textAnchor="middle">{`${m.month}月`}</text>
+                          <text className="chart-tick" x={cx} y={yScale(m.income)-6} textAnchor="middle" style={{fontSize:9, fill:"var(--ink-2)", fontWeight:600}}>{fmtMoneyShort(m.income)}</text>
+                        </g>
+                      );
+                    })}
+                  </>
+                );
+              })()}
+            </svg>
+          </div>
+          <div className="legend-row" style={{marginTop:8}}>
+            <span><span className="legend-dot" style={{background:"var(--accent)"}}></span>入金</span>
+            <span><span className="legend-dot" style={{background:"var(--warning)"}}></span>支出 (管理会社負担)</span>
+            <span><span className="legend-dot" style={{background:"var(--success)"}}></span>純利益</span>
+          </div>
+        </div>
+      </div>
+
+      {/* ====== カテゴリ別収支 ====== */}
+      <div className="card" style={{marginTop:16}}>
+        <div className="card-head"><div className="card-head-title">カテゴリ別収支 (今月 vs 前月)</div></div>
+        <div className="table-wrap">
+          <table className="data">
+            <thead><tr><th>区分</th><th>項目</th><th style={{textAlign:"right"}}>今月</th><th style={{textAlign:"right"}}>前月</th><th style={{textAlign:"right"}}>増減</th><th>状況</th></tr></thead>
+            <tbody>
+              {[
+                {kind:"income",  name:"入金合計 (借主→管理会社)", cur:current.income,           prev:previous.income},
+                {kind:"income",  name:"うち管理手数料 (収益)",       cur:current.managementFee,    prev:previous.managementFee},
+                {kind:"flow",    name:"家主送金 (素通し)",          cur:current.ownerRemit,       prev:previous.ownerRemit},
+                {kind:"expense", name:"業者支払 (管理会社負担)",    cur:current.vendorTotal,      prev:previous.vendorTotal},
+                {kind:"expense", name:"修繕費 (管理会社負担)",      cur:current.repairMgmtBurden, prev:previous.repairMgmtBurden},
+              ].map((row,i) => {
+                const d = row.cur - row.prev;
+                const pct = row.prev !== 0 ? (d/row.prev)*100 : null;
+                const badgeClass = row.kind === "income" ? "badge-info" : row.kind === "expense" ? "badge-warning" : "badge-neutral";
+                const badgeLabel = row.kind === "income" ? "収入" : row.kind === "expense" ? "支出" : "通過";
+                return (
+                  <tr key={i}>
+                    <td><span className={`badge ${badgeClass}`}>{badgeLabel}</span></td>
+                    <td className="primary-cell">{row.name}</td>
+                    <td className="col-num">{fmtMoney(row.cur)}</td>
+                    <td className="col-num muted">{fmtMoney(row.prev)}</td>
+                    <td className="col-num" style={{
+                      color: row.kind === "expense"
+                        ? (d > 0 ? "var(--danger)" : d < 0 ? "var(--success)" : "var(--muted)")
+                        : (d > 0 ? "var(--success)" : d < 0 ? "var(--danger)" : "var(--muted)"),
+                      fontWeight:600
+                    }}>{d >= 0 ? "+" : ""}{fmtMoney(d)}</td>
+                    <td>{pct !== null && Math.abs(pct) >= 0.1 ? `${pct >= 0 ? "+" : ""}${pct.toFixed(1)}%` : "—"}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* ====== 大口取引 ====== */}
+      <div className="card" style={{marginTop:16}}>
+        <div className="card-head"><div className="card-head-title">大口取引 (今月、上位8件)</div></div>
+        <div className="table-wrap">
+          <table className="data">
+            <thead><tr><th>区分</th><th>日付</th><th>内容</th><th style={{textAlign:"right"}}>金額</th></tr></thead>
+            <tbody>
+              {topTransactions.length === 0 ? (
+                <tr><td colSpan="4" className="empty">{fmtYM(year, month)} の取引データはありません</td></tr>
+              ) : topTransactions.map((t, i) => (
+                <tr key={i}>
+                  <td><span className={`badge ${t.kind === "income" ? "badge-info" : "badge-warning"}`}>{t.kind === "income" ? "収入" : "支出"}</span></td>
+                  <td>{fmtDate(t.date)}</td>
+                  <td className="primary-cell">{t.label}</td>
+                  <td className="col-num" style={{color: t.kind === "income" ? "var(--success)" : "var(--ink)", fontWeight:600}}>{t.kind === "income" ? "+" : "−"}{fmtMoney(t.amount)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* 工事案件の月次キャッシュフロー寄与は computeMonth() で算出済。
+          詳細な案件管理は左サイドバー「工事案件」ページで行い、
+          AI分析プロンプトには全エンティティ統計として自動的に含まれます。 */}
+    </>
+  );
+}
+
+/* ==========================================================================
+   Audit Log Page
+   ========================================================================== */
+function AuditLogPage({data}) {
+  const logs = data.auditLog || [];
+  const [page, setPage] = useState(1);
+  const PAGE_SIZE = 100;
+  const paged = useMemo(() => logs.slice((page-1)*PAGE_SIZE, page*PAGE_SIZE), [logs, page]);
+  return (
+    <>
+      <div className="page-head">
+        <div className="page-title-block">
+          <div className="page-kicker">System</div>
+          <h1 className="page-title">操作ログ</h1>
+          <div className="page-subtitle">直近 {Math.min(logs.length, 1000).toLocaleString()} 件の操作履歴 (古いものは自動削除)</div>
+        </div>
+      </div>
+      {logs.length === 0 ? (
+        <div className="card"><div className="empty"><span className="empty-glyph">録</span>
+          <div className="empty-title">操作履歴はまだありません</div>
+          <div className="empty-text">データの追加・編集・削除を行うと、ここに記録されます。</div>
+        </div></div>
+      ) : (
+        <div className="card">
+          <div className="card-body">
+            <div className="log-list">
+              {paged.map(l => (
+                <div key={l.id} className="log-item">
+                  <span className="log-time">{fmtDateTime(l.ts)}</span>
+                  <span><span className="badge badge-neutral">{l.entity}</span></span>
+                  <span className="log-summary">{l.summary}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          <Pagination page={page} setPage={setPage} total={logs.length} pageSize={PAGE_SIZE} />
+        </div>
+      )}
+    </>
+  );
+}
+
+/* ==========================================================================
+   Settings Page
+   ========================================================================== */
+/* ==========================================================================
+   Building Detail Page
+   ========================================================================== */
+function BuildingDetailPage({data, buildingId, onBack, onEditBuilding, onNav}) {
+  const building = (data.building||[]).find(b => b.id === buildingId);
+  if(!building) {
+    return (
+      <>
+        <div className="page-head">
+          <div className="page-title-block">
+            <div className="page-kicker">Not Found</div>
+            <h1 className="page-title">建物が見つかりません</h1>
+          </div>
+          <div className="page-actions">
+            <button className="btn" onClick={onBack}>← 建物一覧へ</button>
+          </div>
+        </div>
+      </>
+    );
+  }
+
+  const owner = (data.owner||[]).find(o => o.id === building.ownerId);
+  const rooms = (data.room||[]).filter(r => r.buildingId === buildingId);
+  const roomIds = rooms.map(r => r.id);
+  const contracts = (data.contract||[]).filter(c => roomIds.includes(c.roomId));
+  const activeContracts = contracts.filter(c => c.status === "契約中");
+  const contractIds = contracts.map(c => c.id);
+  const billings = (data.billing||[]).filter(b => contractIds.includes(b.contractId));
+  const tickets = (data.ticket||[]).filter(t => roomIds.includes(t.roomId));
+  const repairs = (data.repair||[]).filter(r => r.buildingId === buildingId);
+
+  // Occupancy
+  const occupied = rooms.filter(r => r.status === "入居中").length;
+  const vacant = rooms.filter(r => r.status === "空室").length;
+  const listed = rooms.filter(r => r.status === "募集中").length;
+  const occupancyRate = rooms.length === 0 ? 0 : Math.round((occupied / rooms.length) * 100);
+
+  // Monthly revenue this month
+  const {year, month} = currentYM();
+  const thisMonthBillings = billings.filter(b => b.year === year && b.month === month);
+  const monthBilled = thisMonthBillings.reduce((s, b) => s + (Number(b.totalAmount)||0), 0);
+  const monthReceived = thisMonthBillings.reduce((s, b) => s + (Number(b.paidAmount)||0), 0);
+
+  // Yearly revenue (last 12 months)
+  const yearlyRevenue = useMemo(() => {
+    const now = new Date();
+    let total = 0;
+    for(let i = 0; i < 12; i++){
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const y = d.getFullYear(), m = d.getMonth() + 1;
+      total += billings.filter(b => b.year === y && b.month === m).reduce((s, b) => s + (Number(b.paidAmount)||0), 0);
+    }
+    return total;
+  }, [billings]);
+
+  // Expected monthly rent
+  const expectedRent = activeContracts.reduce((s, c) => s + (Number(c.rent)||0) + (Number(c.fee)||0), 0);
+
+  const buildingAge = building.builtYear ? new Date().getFullYear() - Number(building.builtYear) : null;
+
+  return (
+    <>
+      <div className="page-head">
+        <div className="page-title-block">
+          <div className="page-kicker">Building Detail</div>
+          <h1 className="page-title">{building.name}</h1>
+          <div className="page-subtitle">
+            {building.kana && <span>{building.kana} ・ </span>}
+            {building.address || "住所未登録"}
+          </div>
+        </div>
+        <div className="page-actions">
+          <button className="btn" onClick={onBack}>← 建物一覧へ</button>
+          <button className="btn" onClick={() => onEditBuilding(building)}>建物情報を編集</button>
+        </div>
+      </div>
+
+      <div className="stat-grid">
+        <Stat label="管理戸数" value={rooms.length} unit="室" meta={`${building.structure || "-"} / ${building.floors || "-"}階建`} />
+        <Stat label="入居率" value={occupancyRate} unit="%" meta={`入居 ${occupied} / 募集 ${listed} / 空室 ${vacant}`} className={occupancyRate >= 90 ? "success" : occupancyRate >= 70 ? "" : "warn"} />
+        <Stat label="想定月額賃料" value={expectedRent} format="money" meta="契約中の合計" />
+        <Stat label={`${year}年${month}月入金`} value={monthReceived} format="money" meta={`請求 ${fmtMoney(monthBilled)}`} className="success" />
+        <Stat label="直近12ヶ月入金" value={yearlyRevenue} format="money" />
+      </div>
+
+      <div className="card">
+        <div className="card-head"><div className="card-head-title">建物情報</div></div>
+        <div className="card-body">
+          <div className="kv-grid">
+            <dt>建物名</dt><dd>{building.name}</dd>
+            <dt>所有者</dt><dd>{owner ? <span className="row-link" onClick={() => onNav("owner")}>{owner.name}</span> : "—"}</dd>
+            <dt>所在地</dt><dd>{building.zip ? `〒${building.zip} ` : ""}{building.address || "—"}</dd>
+            <dt>構造</dt><dd>{building.structure || "—"} / {building.floors ? `${building.floors}階建` : "—"} / 総戸数 {building.totalUnits || "—"}</dd>
+            <dt>築年月</dt><dd>{building.builtYear ? `${building.builtYear}年${building.builtMonth || ""}${building.builtMonth ? "月" : ""}` : "—"}{buildingAge !== null && ` （築${buildingAge}年）`}</dd>
+            <dt>駐車場</dt><dd>{building.parking || "—"}</dd>
+            {building.memo && (<><dt>備考</dt><dd>{building.memo}</dd></>)}
+          </div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-head"><div className="card-head-title">部屋一覧（{rooms.length}室）</div></div>
+        {rooms.length === 0 ? (
+          <div className="card-body muted">部屋が登録されていません</div>
+        ) : (
+          <div className="table-wrap">
+            <table className="data">
+              <thead>
+                <tr>
+                  <th>部屋番号</th><th>間取り</th><th>面積</th><th>賃料</th><th>共益費</th><th>状態</th><th>入居者</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rooms.sort((a,b) => String(a.roomNo).localeCompare(String(b.roomNo), "ja", {numeric:true})).map(r => {
+                  const activeContract = activeContracts.find(c => c.roomId === r.id);
+                  return (
+                    <tr key={r.id}>
+                      <td className="primary-cell">{r.roomNo}号室<span className="sub">{r.floor ? `${r.floor}階` : ""}{r.direction && r.direction !== "-" ? ` / ${r.direction}向き` : ""}</span></td>
+                      <td>{r.layout || "—"}</td>
+                      <td className="col-num">{r.area ? `${r.area}㎡` : "—"}</td>
+                      <td className="col-num">{fmtMoney(r.rent)}</td>
+                      <td className="col-num">{fmtMoney(r.fee)}</td>
+                      <td>{renderCell({sections:[]}, r, "status", data)}</td>
+                      <td>{activeContract ? activeContract.tenantName : <span className="muted">—</span>}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      <div className="dash-row">
+        <div className="card">
+          <div className="card-head"><div className="card-head-title">契約一覧（{contracts.length}件）</div></div>
+          {contracts.length === 0 ? (
+            <div className="card-body muted">契約がありません</div>
+          ) : (
+            <div className="table-wrap">
+              <table className="data">
+                <thead><tr><th>契約番号</th><th>契約者</th><th>部屋</th><th>状態</th></tr></thead>
+                <tbody>
+                  {contracts.sort((a,b) => (b.startDate||"").localeCompare(a.startDate||"")).slice(0, 10).map(c => (
+                    <tr key={c.id}>
+                      <td className="primary-cell">{c.contractNo}<span className="sub">{fmtDate(c.startDate)} 〜 {fmtDate(c.endDate)}</span></td>
+                      <td>{c.tenantName}</td>
+                      <td>{(() => { const r = rooms.find(r => r.id === c.roomId); return r ? `${r.roomNo}号室` : "—"; })()}</td>
+                      <td>{renderCell({sections:[]}, c, "status", data)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+
+        <div className="card">
+          <div className="card-head"><div className="card-head-title">修繕履歴（{repairs.length}件）</div></div>
+          {repairs.length === 0 ? (
+            <div className="card-body muted">修繕履歴がありません</div>
+          ) : (
+            <div className="table-wrap">
+              <table className="data">
+                <thead><tr><th>予定日</th><th>業者</th><th>内容</th><th>費用</th><th>状態</th></tr></thead>
+                <tbody>
+                  {repairs.sort((a,b) => (b.scheduledDate||"").localeCompare(a.scheduledDate||"")).slice(0, 10).map(rp => (
+                    <tr key={rp.id}>
+                      <td className="tabular">{fmtDate(rp.scheduledDate)}</td>
+                      <td>{refLabel(data, "vendor", rp.vendorId)}</td>
+                      <td>{rp.workContent}</td>
+                      <td className="col-num">{fmtMoney(rp.cost)}</td>
+                      <td>{renderCell({sections:[]}, rp, "status", data)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-head"><div className="card-head-title">問い合わせ履歴（{tickets.length}件）</div></div>
+        {tickets.length === 0 ? (
+          <div className="card-body muted">問い合わせ履歴がありません</div>
+        ) : (
+          <div className="table-wrap">
+            <table className="data">
+              <thead><tr><th>受付日</th><th>番号</th><th>問い合わせ元</th><th>カテゴリ</th><th>優先度</th><th>状態</th></tr></thead>
+              <tbody>
+                {tickets.sort((a,b) => (b.inquiryDate||"").localeCompare(a.inquiryDate||"")).slice(0, 10).map(t => (
+                  <tr key={t.id}>
+                    <td className="tabular">{fmtDate(t.inquiryDate)}</td>
+                    <td>{t.ticketNo}</td>
+                    <td>{t.inquirerName}</td>
+                    <td>{t.category}</td>
+                    <td>{renderCell({sections:[]}, t, "priority", data)}</td>
+                    <td>{renderCell({sections:[]}, t, "status", data)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
+function SettingsPage({data, onChange}) {
+  const [form, setForm] = useState(data.settings);
+  const [saved, setSaved] = useState(false);
+  const handleSave = () => {
+    onChange(form);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+  };
+  return (
+    <>
+      <div className="page-head">
+        <div className="page-title-block">
+          <div className="page-kicker">System</div>
+          <h1 className="page-title">設定</h1>
+          <div className="page-subtitle">運用パラメータの設定</div>
+        </div>
+      </div>
+      {saved && <div className="banner success">設定を保存しました</div>}
+      <div className="card">
+        <div className="card-head"><div className="card-head-title">基本設定</div></div>
+        <div className="card-body">
+          <div className="form-grid">
+            <div className="form-field full">
+              <label className="form-label">会社名</label>
+              <input className="form-input" value={form.companyName||""} onChange={e => setForm({...form, companyName:e.target.value})} />
+              <div className="form-help">帳票・レポートに表示される自社名</div>
+            </div>
+            <div className="form-field">
+              <label className="form-label">管理手数料率 <span className="req">●</span></label>
+              <input className="form-input" type="number" min="0" max="100" step="0.1" value={form.managementFeeRate||""} onChange={e => setForm({...form, managementFeeRate:Number(e.target.value)})} />
+              <div className="form-help">家主送金時に賃料合計から差し引く料率（%）</div>
+            </div>
+            <div className="form-field">
+              <label className="form-label">消費税率</label>
+              <input className="form-input" type="number" min="0" max="100" step="0.1" value={form.consumptionTaxRate||""} onChange={e => setForm({...form, consumptionTaxRate:Number(e.target.value)})} />
+              <div className="form-help">課税仕訳に使用（%）</div>
+            </div>
+            <div className="form-field">
+              <label className="form-label">標準支払期限日</label>
+              <input className="form-input" type="number" min="1" max="31" value={form.defaultDueDay||""} onChange={e => setForm({...form, defaultDueDay:Number(e.target.value)})} />
+              <div className="form-help">月次請求作成時の支払期限（日）</div>
+            </div>
+            <div className="form-field full">
+              <label className="form-label">自社振込先口座（参考表示用）</label>
+              <input className="form-input" value={form.bankAccount||""} onChange={e => setForm({...form, bankAccount:e.target.value})} placeholder="○○銀行 △△支店 普通 1234567" />
+            </div>
+          </div>
+        </div>
+        <div className="modal-foot" style={{borderTop:"1px solid var(--border)"}}>
+          <button className="btn btn-primary" onClick={handleSave}>設定を保存</button>
+        </div>
+      </div>
+      <div className="card">
+        <div className="card-head">
+          <div className="card-head-title">
+            ⚡ AI連携設定
+            {form.aiEnabled && form.aiApiKey ? <span className="badge badge-success" style={{marginLeft:8}}>有効</span> : <span className="badge badge-neutral" style={{marginLeft:8}}>未設定</span>}
+          </div>
+        </div>
+        <div className="card-body">
+          <div className="banner info" style={{marginBottom:14, fontSize:12, lineHeight:1.7}}>
+            <strong>Claude API 直結モード</strong>: APIキーをこの端末に保存し、ブラウザから Anthropic API へ直接送信します。個人利用向け。<br/>
+            <strong>BMS Gateway モード</strong>: 将来 BMS API Gateway を経由する設定。エンドポイントURLとアクセストークンを登録します。<br/>
+            ⚠ APIキーはこのブラウザのIndexedDBに平文保存されます。他人がこの端末を触れる環境では有効化しないでください。
+          </div>
+          <div className="form-grid">
+            <div className="form-field">
+              <label className="form-label">AI連携を有効化</label>
+              <select className="form-select" value={form.aiEnabled ? "on" : "off"} onChange={e => setForm({...form, aiEnabled: e.target.value === "on"})}>
+                <option value="off">無効</option>
+                <option value="on">有効</option>
+              </select>
+              <div className="form-help">有効化するとキャッシュフローページからAI分析を実行できる</div>
+            </div>
+            <div className="form-field">
+              <label className="form-label">接続モード</label>
+              <select className="form-select" value={form.aiAuthMode||"direct"} onChange={e => setForm({...form, aiAuthMode: e.target.value})}>
+                <option value="direct">Anthropic 直結 (x-api-key)</option>
+                <option value="gateway">BMS Gateway 経由 (Bearer Token)</option>
+              </select>
+              <div className="form-help">将来 BMS Gateway 完成時にスイッチで切替</div>
+            </div>
+            <div className="form-field full">
+              <label className="form-label">APIエンドポイントURL</label>
+              <input className="form-input" type="url" value={form.aiEndpoint||""}
+                     onChange={e => setForm({...form, aiEndpoint: e.target.value})}
+                     placeholder="https://api.anthropic.com/v1/messages" />
+              <div className="form-help">
+                Anthropic直結: <code>https://api.anthropic.com/v1/messages</code> /
+                BMS Gateway: <code>https://gateway.bms.example/v1/claude/messages</code> (今後発行)
+              </div>
+            </div>
+            <div className="form-field full">
+              <label className="form-label">APIキー / アクセストークン <span className="req">●</span></label>
+              <input className="form-input" type="password" value={form.aiApiKey||""}
+                     onChange={e => setForm({...form, aiApiKey: e.target.value})}
+                     placeholder={form.aiAuthMode === "gateway" ? "BMS Gateway から発行されたアクセストークン" : "sk-ant-api..."} />
+              <div className="form-help">
+                {form.aiAuthMode === "gateway"
+                  ? "BMS API Gateway から発行されたアクセストークン (Bearer ヘッダで送信)"
+                  : "console.anthropic.com で発行した API キー (x-api-key ヘッダで送信)"}
+              </div>
+            </div>
+            <div className="form-field">
+              <label className="form-label">モデル</label>
+              <select className="form-select" value={form.aiModel||"claude-sonnet-4-5"} onChange={e => setForm({...form, aiModel: e.target.value})}>
+                <option value="claude-sonnet-4-5">claude-sonnet-4-5 (推奨・バランス型)</option>
+                <option value="claude-opus-4-5">claude-opus-4-5 (高品質・高コスト)</option>
+                <option value="claude-haiku-4-5">claude-haiku-4-5 (高速・低コスト)</option>
+              </select>
+              <div className="form-help">分析の品質と速度・コストのトレードオフ</div>
+            </div>
+            <div className="form-field">
+              <label className="form-label">最大トークン数</label>
+              <input className="form-input" type="number" min="512" max="32000" step="512"
+                     value={form.aiMaxTokens||4096}
+                     onChange={e => setForm({...form, aiMaxTokens: Number(e.target.value)})} />
+              <div className="form-help">レポート出力の上限。長文分析は4096〜8192推奨</div>
+            </div>
+          </div>
+        </div>
+        <div className="modal-foot" style={{borderTop:"1px solid var(--border)"}}>
+          <button className="btn btn-primary" onClick={handleSave}>AI連携設定を保存</button>
+        </div>
+      </div>
+      <div className="card">
+        <div className="card-head"><div className="card-head-title">データ管理</div></div>
+        <div className="card-body">
+          <div className="banner info" style={{marginBottom:14}}>
+            データはブラウザのlocalStorageに保存されています。<strong>ブラウザのデータ削除やプライベートモード切替で全消失します</strong>。定期的にJSONバックアップを取得してください。
+          </div>
+          <div className="kv-grid" style={{marginBottom:14}}>
+            <dt>現在使用量</dt><dd className="tabular">{(getStorageUsage(data)/1024).toFixed(1)} KB <span className="muted" style={{fontSize:11}}>（目安: 5〜10MB上限）</span></dd>
+            <dt>登録件数（合計）</dt><dd className="tabular">{[...ENTITY_ORDER, ...OPS_ORDER, "billing", "payment", "remittance"].reduce((s,k) => s + ((data[k]||[]).length), 0)} 件</dd>
+            <dt>操作ログ</dt><dd className="tabular">{(data.auditLog||[]).length} 件 <span className="muted" style={{fontSize:11}}>（1000件超は古い順に自動削除）</span></dd>
+          </div>
+          <div style={{display:"flex", gap:8, flexWrap:"wrap"}}>
+            <button className="btn btn-primary" onClick={() => {
+              downloadFile(`kanri_backup_${todayLocal()}.json`, JSON.stringify(data, null, 2), "application/json");
+            }}>JSONバックアップをダウンロード</button>
+            <label className="btn" style={{cursor:"pointer"}}>
+              JSONから復元
+              <input type="file" accept=".json" style={{display:"none"}} onChange={(e) => {
+                const f = e.target.files?.[0]; if(!f) return;
+                const reader = new FileReader();
+                reader.onload = async (ev) => {
+                  try {
+                    const parsed = JSON.parse(ev.target.result);
+                    if(!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !Array.isArray(parsed.owner)) {
+                      alert("ファイルの形式が不正です。Kanri Systemのバックアップファイル(JSON)を指定してください。");
+                      return;
+                    }
+                    if(!confirm(`既存データを置き換えます。\n\n復元元: ${f.name}\n物件数: ${(parsed.building||[]).length} 棟 / 部屋: ${(parsed.room||[]).length} 室\n\nこの操作は元に戻せません。続行しますか？`)) return;
+                    // IndexedDB に直接書き込んでからリロード
+                    await _idbSet(IDB_KEY, _validateData(parsed));
+                    location.reload();
+                  } catch(err) { alert("ファイルの読み込みに失敗しました: " + err.message); }
+                };
+                reader.readAsText(f);
+                e.target.value = ""; // allow same file reselection
+              }} />
+            </label>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+/* ==========================================================================
+   Generic Form Modal
+   ========================================================================== */
+function FormModal({entityKey, item, data, onClose, onSave}) {
+  const cfg = ENTITIES[entityKey] || OPS[entityKey];
+  const isNew = !item;
+
+  const buildInitial = () => {
+    if(item) return {...item};
+    const init = {id:newId(cfg.idPrefix)};
+    for(const sec of cfg.sections) {
+      for(const f of sec.fields) {
+        if(typeof f.default === "function") init[f.key] = f.default();
+        else init[f.key] = f.default !== undefined ? f.default : "";
+      }
+    }
+    // Auto-defaults for some entities
+    if(entityKey === "application" && !init.applicationDate) init.applicationDate = todayLocal();
+    if(entityKey === "ticket" && !init.inquiryDate) init.inquiryDate = todayLocal();
+    if(entityKey === "contract" && !init.contractNo) init.contractNo = `CT-${new Date().getFullYear()}-${String((data.contract||[]).length+1).padStart(3,"0")}`;
+    if(entityKey === "ticket" && !init.ticketNo) init.ticketNo = `TK-${new Date().getFullYear()}-${String((data.ticket||[]).length+1).padStart(3,"0")}`;
+    return init;
+  };
+
+  const [form, setForm] = useState(buildInitial);
+  const [errors, setErrors] = useState({});
+  const [busy, setBusy] = useState(false);
+
+  const handleChange = (key, value) => {
+    setForm(prev => ({...prev, [key]:value}));
+    if(errors[key]) setErrors(prev => { const n = {...prev}; delete n[key]; return n; });
+  };
+
+  const handleSubmit = () => {
+    if(busy) return;
+    const errs = {};
+    for(const sec of cfg.sections) {
+      for(const f of sec.fields) {
+        if(f.required && !String(form[f.key]||"").trim()) errs[f.key] = "必須項目です";
+      }
+    }
+    if(Object.keys(errs).length) { setErrors(errs); return; }
+    setBusy(true);
+    try { onSave(form); } catch(e) { setBusy(false); alert("保存に失敗しました: " + e.message); }
+  };
+
+  useEffect(() => {
+    const fn = (e) => { if(e.key === "Escape" && !busy) onClose(); };
+    window.addEventListener("keydown", fn);
+    return () => window.removeEventListener("keydown", fn);
+  }, [onClose, busy]);
+
+  return (
+    <div className="modal-backdrop" onClick={(e) => { if(e.target === e.currentTarget && !busy) onClose(); }}>
+      <div className="modal" role="dialog" aria-modal="true">
+        <div className="modal-head">
+          <div>
+            <div className="modal-kicker">{isNew ? "New Record" : "Edit Record"}</div>
+            <div className="modal-title">{cfg.label}の{isNew ? "新規登録" : "編集"}</div>
+          </div>
+          <button className="modal-close" onClick={onClose} aria-label="閉じる" disabled={busy}>×</button>
+        </div>
+        <div className="modal-body">
+          <div className="form-grid">
+            {cfg.sections.map((sec, si) => (
+              <React.Fragment key={si}>
+                <div className="form-section-title">{sec.title}</div>
+                {sec.fields.map(f => (
+                  <FormField key={f.key} field={f} value={form[f.key]} onChange={(v) => handleChange(f.key, v)} error={errors[f.key]} data={data} />
+                ))}
+              </React.Fragment>
+            ))}
+          </div>
+        </div>
+        <div className="modal-foot">
+          <button className="btn" onClick={onClose} disabled={busy}>キャンセル</button>
+          <button className="btn btn-primary" onClick={handleSubmit} disabled={busy}>{busy ? "処理中..." : (isNew ? "登録する" : "更新する")}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FormField({field, value, onChange, error, data}) {
+  const f = field;
+  const id = `f_${f.key}`;
+  const baseProps = { id, value: value ?? "", onChange: (e) => onChange(e.target.value), placeholder: f.placeholder || "" };
+  let input;
+  if(f.type === "textarea") input = <textarea className="form-textarea" rows={3} {...baseProps} />;
+  else if(f.type === "select") input = <select className="form-select" {...baseProps}><option value="">選択してください</option>{f.options.map(opt => <option key={opt} value={opt}>{opt}</option>)}</select>;
+  else if(f.type === "ref") {
+    const refItems = data[f.refEntity] || [];
+    input = <select className="form-select" {...baseProps}><option value="">選択してください</option>{refItems.map(it => <option key={it.id} value={it.id}>{refLabel(data, f.refEntity, it.id)}</option>)}</select>;
+  }
+  else if(f.type === "money" || f.type === "number") input = <input className="form-input" type="number" {...baseProps} />;
+  else if(f.type === "date") input = <input className="form-input" type="date" {...baseProps} />;
+  else input = <input className="form-input" type={f.type||"text"} {...baseProps} />;
+  return (
+    <div className={`form-field ${f.full ? "full" : ""}`}>
+      <label className="form-label" htmlFor={id}>{f.label} {f.required && <span className="req">●</span>}</label>
+      {input}
+      {error && <span style={{fontSize:11, color:"var(--accent)"}}>{error}</span>}
+    </div>
+  );
+}
+
+function ConfirmModal({title, message, confirmLabel, onConfirm, onCancel}) {
+  const [busy, setBusy] = useState(false);
+  useEffect(() => { const fn = (e) => { if(e.key === "Escape" && !busy) onCancel(); }; window.addEventListener("keydown", fn); return () => window.removeEventListener("keydown", fn); }, [onCancel, busy]);
+  const handle = () => { if(busy) return; setBusy(true); try { onConfirm(); } finally { /* parent unmounts us */ } };
+  return (
+    <div className="modal-backdrop" onClick={(e) => { if(e.target === e.currentTarget && !busy) onCancel(); }}>
+      <div className="modal confirm" role="dialog">
+        <div className="modal-head"><div><div className="modal-kicker">Confirmation</div><div className="modal-title">{title}</div></div><button className="modal-close" onClick={onCancel} disabled={busy}>×</button></div>
+        <div className="modal-body"><p style={{whiteSpace:"pre-line"}}>{message}</p></div>
+        <div className="modal-foot"><button className="btn" onClick={onCancel} disabled={busy}>キャンセル</button><button className="btn btn-danger" onClick={handle} disabled={busy}>{busy ? "処理中..." : confirmLabel}</button></div>
+      </div>
+    </div>
+  );
+}
+
+/* ==========================================================================
+   Workflow Modals
+   ========================================================================== */
+function ApproveApplicationModal({data, application, onClose, onConfirm}) {
+  const room = data.room.find(r => r.id === application.roomId);
+  const isRoomOccupied = room && room.status === "入居中";
+  const activeContractOnRoom = (data.contract||[]).find(c => c.roomId === application.roomId && c.status === "契約中");
+  const [form, setForm] = useState({
+    contractNo: `CT-${new Date().getFullYear()}-${String((data.contract||[]).length+1).padStart(3,"0")}`,
+    contractDate: todayLocal(),
+    startDate: application.moveInWish || todayLocal(),
+    endDate: "",
+    rent: room?.rent || 0,
+    fee: room?.fee || 0,
+    deposit: room?.deposit || 0,
+    keyMoney: room?.keyMoney || 0,
+    guarantor: "",
+  });
+  // Auto-compute endDate = startDate + 2 years
+  useEffect(() => {
+    if(form.startDate && !form.endDate) {
+      const d = new Date(form.startDate);
+      d.setFullYear(d.getFullYear() + 2);
+      d.setDate(d.getDate() - 1);
+      setForm(prev => ({...prev, endDate:dateToYMD(d)}));
+    }
+  }, [form.startDate]);
+
+  // Validate date range
+  const dateError = form.startDate && form.endDate && form.endDate <= form.startDate
+    ? "契約終了日は契約開始日より後の日付を指定してください" : null;
+  const contractNoExists = (data.contract||[]).some(c => c.contractNo === form.contractNo);
+  const canSubmit = !!form.contractNo && !!form.startDate && !!form.endDate && !dateError && !contractNoExists;
+
+  return (
+    <div className="modal-backdrop" onClick={(e) => { if(e.target === e.currentTarget) onClose(); }}>
+      <div className="modal">
+        <div className="modal-head"><div><div className="modal-kicker">Approve & Create Contract</div><div className="modal-title">申込を承認 → 契約作成</div></div><button className="modal-close" onClick={onClose}>×</button></div>
+        <div className="modal-body">
+          <div className="banner info">
+            <strong>申込内容:</strong> {application.applicantName} / {refLabel(data,"room",application.roomId)}<br/>
+            承認すると、契約レコードと契約者レコードが自動作成され、部屋が「入居中」になります。
+          </div>
+          {isRoomOccupied && (
+            <div className="banner warn">
+              <strong>⚠️ 注意:</strong> この部屋は現在「入居中」です。
+              {activeContractOnRoom && <> 既存契約「{activeContractOnRoom.contractNo}」（{activeContractOnRoom.tenantName}）があります。</>}
+              <br/>承認前に既存契約の解約処理を行うか、契約開始日を既存契約終了日より後に設定してください。
+            </div>
+          )}
+          {dateError && <div className="banner warn"><strong>⚠️ 日付エラー:</strong> {dateError}</div>}
+          {contractNoExists && <div className="banner warn"><strong>⚠️ 契約番号重複:</strong> 同じ契約番号が既に存在します。別の番号にしてください。</div>}
+          <div className="form-grid">
+            <div className="form-section-title">契約基本情報</div>
+            <div className="form-field"><label className="form-label">契約番号 <span className="req">●</span></label><input className="form-input" value={form.contractNo} onChange={e => setForm({...form, contractNo:e.target.value})} /></div>
+            <div className="form-field"><label className="form-label">契約締結日</label><input className="form-input" type="date" value={form.contractDate} onChange={e => setForm({...form, contractDate:e.target.value})} /></div>
+            <div className="form-field"><label className="form-label">契約開始日 <span className="req">●</span></label><input className="form-input" type="date" value={form.startDate} onChange={e => setForm({...form, startDate:e.target.value})} /></div>
+            <div className="form-field"><label className="form-label">契約終了日 <span className="req">●</span></label><input className="form-input" type="date" value={form.endDate} onChange={e => setForm({...form, endDate:e.target.value})} /></div>
+            <div className="form-section-title">賃料・諸費用</div>
+            <div className="form-field"><label className="form-label">賃料 (円/月)</label><input className="form-input" type="number" min="0" value={form.rent} onChange={e => setForm({...form, rent:Math.max(0, Number(e.target.value))})} /></div>
+            <div className="form-field"><label className="form-label">共益費 (円/月)</label><input className="form-input" type="number" min="0" value={form.fee} onChange={e => setForm({...form, fee:Math.max(0, Number(e.target.value))})} /></div>
+            <div className="form-field"><label className="form-label">敷金</label><input className="form-input" type="number" min="0" value={form.deposit} onChange={e => setForm({...form, deposit:Math.max(0, Number(e.target.value))})} /></div>
+            <div className="form-field"><label className="form-label">礼金</label><input className="form-input" type="number" min="0" value={form.keyMoney} onChange={e => setForm({...form, keyMoney:Math.max(0, Number(e.target.value))})} /></div>
+            <div className="form-field full"><label className="form-label">保証会社</label><input className="form-input" value={form.guarantor} onChange={e => setForm({...form, guarantor:e.target.value})} /></div>
+          </div>
+        </div>
+        <div className="modal-foot">
+          <button className="btn" onClick={onClose}>キャンセル</button>
+          <button className="btn btn-primary" onClick={() => onConfirm(form)} disabled={!canSubmit}>承認して契約作成</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RenewContractModal({contract, onClose, onConfirm}) {
+  const [form, setForm] = useState({
+    contractNo: `${contract.contractNo}-R`,
+    contractDate: todayLocal(),
+    startDate: contract.endDate || "",
+    endDate: "",
+    rent: contract.rent || 0,
+    fee: contract.fee || 0,
+    renewalFee: contract.rent || 0,
+  });
+  useEffect(() => {
+    if(form.startDate && !form.endDate) {
+      const d = new Date(form.startDate);
+      d.setFullYear(d.getFullYear() + 2);
+      d.setDate(d.getDate() - 1);
+      setForm(prev => ({...prev, endDate:dateToYMD(d)}));
+    }
+  }, [form.startDate]);
+  const dateError = form.startDate && form.endDate && form.endDate <= form.startDate
+    ? "新契約終了日は新契約開始日より後の日付を指定してください" : null;
+  const canSubmit = !!form.contractNo && !!form.startDate && !!form.endDate && !dateError;
+  return (
+    <div className="modal-backdrop" onClick={(e) => { if(e.target === e.currentTarget) onClose(); }}>
+      <div className="modal">
+        <div className="modal-head"><div><div className="modal-kicker">Renew Contract</div><div className="modal-title">契約更新</div></div><button className="modal-close" onClick={onClose}>×</button></div>
+        <div className="modal-body">
+          <div className="banner info">元契約「{contract.contractNo}」({contract.tenantName}) を更新します。元契約は「解約済」になり、新しい契約レコードが作成されます。</div>
+          {dateError && <div className="banner warn"><strong>⚠️ 日付エラー:</strong> {dateError}</div>}
+          <div className="form-grid">
+            <div className="form-field"><label className="form-label">新契約番号 <span className="req">●</span></label><input className="form-input" value={form.contractNo} onChange={e => setForm({...form, contractNo:e.target.value})} /></div>
+            <div className="form-field"><label className="form-label">締結日</label><input className="form-input" type="date" value={form.contractDate} onChange={e => setForm({...form, contractDate:e.target.value})} /></div>
+            <div className="form-field"><label className="form-label">新契約開始日 <span className="req">●</span></label><input className="form-input" type="date" value={form.startDate} onChange={e => setForm({...form, startDate:e.target.value})} /></div>
+            <div className="form-field"><label className="form-label">新契約終了日 <span className="req">●</span></label><input className="form-input" type="date" value={form.endDate} onChange={e => setForm({...form, endDate:e.target.value})} /></div>
+            <div className="form-field"><label className="form-label">賃料 (円/月)</label><input className="form-input" type="number" min="0" value={form.rent} onChange={e => setForm({...form, rent:Math.max(0, Number(e.target.value))})} /></div>
+            <div className="form-field"><label className="form-label">共益費 (円/月)</label><input className="form-input" type="number" min="0" value={form.fee} onChange={e => setForm({...form, fee:Math.max(0, Number(e.target.value))})} /></div>
+            <div className="form-field full"><label className="form-label">更新料 (円)</label><input className="form-input" type="number" min="0" value={form.renewalFee} onChange={e => setForm({...form, renewalFee:Math.max(0, Number(e.target.value))})} /></div>
+          </div>
+        </div>
+        <div className="modal-foot">
+          <button className="btn" onClick={onClose}>キャンセル</button>
+          <button className="btn btn-primary" onClick={() => onConfirm(form)} disabled={!canSubmit}>更新する</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TerminateContractModal({contract, onClose, onConfirm}) {
+  const [form, setForm] = useState({
+    terminationDate: todayLocal(),
+    restorationCost: 0,
+    depositRefund: Number(contract.deposit)||0,
+    memo: "",
+  });
+  return (
+    <div className="modal-backdrop" onClick={(e) => { if(e.target === e.currentTarget) onClose(); }}>
+      <div className="modal">
+        <div className="modal-head"><div><div className="modal-kicker">Terminate Contract</div><div className="modal-title">契約解約</div></div><button className="modal-close" onClick={onClose}>×</button></div>
+        <div className="modal-body">
+          <div className="banner warn">契約「{contract.contractNo}」({contract.tenantName}) を解約します。対象部屋は「空室」になります。</div>
+          <div className="form-grid">
+            <div className="form-field"><label className="form-label">解約日 <span className="req">●</span></label><input className="form-input" type="date" value={form.terminationDate} onChange={e => setForm({...form, terminationDate:e.target.value})} /></div>
+            <div className="form-field"><label className="form-label">原状回復費 (円)</label><input className="form-input" type="number" value={form.restorationCost} onChange={e => setForm({...form, restorationCost:Number(e.target.value)})} /></div>
+            <div className="form-field full"><label className="form-label">敷金返金額 (円)</label><input className="form-input" type="number" value={form.depositRefund} onChange={e => setForm({...form, depositRefund:Number(e.target.value)})} />
+              <div className="form-help">敷金 {fmtMoney(contract.deposit)} − 原状回復費 {fmtMoney(form.restorationCost)} = {fmtMoney((Number(contract.deposit)||0) - form.restorationCost)} が推奨返金額</div>
+            </div>
+            <div className="form-field full"><label className="form-label">解約メモ</label><textarea className="form-textarea" rows={3} value={form.memo} onChange={e => setForm({...form, memo:e.target.value})} /></div>
+          </div>
+        </div>
+        <div className="modal-foot">
+          <button className="btn" onClick={onClose}>キャンセル</button>
+          <button className="btn btn-primary" onClick={() => onConfirm(form)} disabled={!form.terminationDate}>解約する</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BulkBillingModal({onClose, onConfirm}) {
+  const {year, month} = currentYM();
+  const [ym, setYm] = useState(toYM(year, month));
+  return (
+    <div className="modal-backdrop" onClick={(e) => { if(e.target === e.currentTarget) onClose(); }}>
+      <div className="modal confirm">
+        <div className="modal-head"><div><div className="modal-kicker">Generate Billings</div><div className="modal-title">月次請求を一括生成</div></div><button className="modal-close" onClick={onClose}>×</button></div>
+        <div className="modal-body">
+          <p>「契約中」「解約予定」の全契約について、指定月の請求データを作成します。すでにその月の請求が存在する契約はスキップされます。</p>
+          <div className="form-field" style={{marginTop:16}}>
+            <label className="form-label">対象月 <span className="req">●</span></label>
+            <input className="form-input" type="month" value={ym} onChange={e => setYm(e.target.value)} />
+          </div>
+        </div>
+        <div className="modal-foot">
+          <button className="btn" onClick={onClose}>キャンセル</button>
+          <button className="btn btn-primary" onClick={() => { const [y,m] = ym.split("-").map(Number); onConfirm({year:y, month:m}); }}>生成する</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RecordPaymentModal({billing, data, onClose, onConfirm}) {
+  const outstanding = (Number(billing.totalAmount)||0) - (Number(billing.paidAmount)||0);
+  const [form, setForm] = useState({
+    paidDate: todayLocal(),
+    amount: outstanding,
+    method: "振込",
+    memo: "",
+  });
+  return (
+    <div className="modal-backdrop" onClick={(e) => { if(e.target === e.currentTarget) onClose(); }}>
+      <div className="modal">
+        <div className="modal-head"><div><div className="modal-kicker">Record Payment</div><div className="modal-title">入金記録</div></div><button className="modal-close" onClick={onClose}>×</button></div>
+        <div className="modal-body">
+          <div className="form-readonly-block" style={{marginBottom:16}}>
+            <div className="kv-grid">
+              <dt>請求</dt><dd>{refLabel(data,"contract",billing.contractId)} / {billing.year}年{billing.month}月分</dd>
+              <dt>請求額</dt><dd>{fmtMoney(billing.totalAmount)}</dd>
+              <dt>既入金額</dt><dd>{fmtMoney(billing.paidAmount)}</dd>
+              <dt>未収残高</dt><dd style={{color:"var(--accent)"}}>{fmtMoney(outstanding)}</dd>
+            </div>
+          </div>
+          <div className="form-grid">
+            <div className="form-field"><label className="form-label">入金日 <span className="req">●</span></label><input className="form-input" type="date" value={form.paidDate} onChange={e => setForm({...form, paidDate:e.target.value})} /></div>
+            <div className="form-field"><label className="form-label">入金額 <span className="req">●</span></label><input className="form-input" type="number" value={form.amount} onChange={e => setForm({...form, amount:Number(e.target.value)})} /></div>
+            <div className="form-field"><label className="form-label">入金方法</label>
+              <select className="form-select" value={form.method} onChange={e => setForm({...form, method:e.target.value})}>
+                {["振込","現金","口座引落","カード","収納代行","その他"].map(o => <option key={o} value={o}>{o}</option>)}
+              </select>
+            </div>
+            <div className="form-field full"><label className="form-label">メモ</label><input className="form-input" value={form.memo} onChange={e => setForm({...form, memo:e.target.value})} /></div>
+          </div>
+        </div>
+        <div className="modal-foot">
+          <button className="btn" onClick={onClose}>キャンセル</button>
+          <button className="btn btn-primary" onClick={() => onConfirm(form)} disabled={!form.paidDate || !form.amount || form.amount <= 0}>入金を記録</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function GenerateRemittanceModal({onClose, onConfirm}) {
+  const {year, month} = currentYM();
+  const [ym, setYm] = useState(toYM(year, month));
+  return (
+    <div className="modal-backdrop" onClick={(e) => { if(e.target === e.currentTarget) onClose(); }}>
+      <div className="modal confirm">
+        <div className="modal-head"><div><div className="modal-kicker">Generate Remittances</div><div className="modal-title">家主送金データ生成</div></div><button className="modal-close" onClick={onClose}>×</button></div>
+        <div className="modal-body">
+          <p>各家主について、指定月の入金額から管理手数料と家主負担修繕費を差し引いた送金額を自動計算します。<br/>すでにその月の送金データがある家主はスキップされます。</p>
+          <div className="form-field" style={{marginTop:16}}>
+            <label className="form-label">対象月 <span className="req">●</span></label>
+            <input className="form-input" type="month" value={ym} onChange={e => setYm(e.target.value)} />
+          </div>
+        </div>
+        <div className="modal-foot">
+          <button className="btn" onClick={onClose}>キャンセル</button>
+          <button className="btn btn-primary" onClick={() => { const [y,m] = ym.split("-").map(Number); onConfirm({year:y, month:m}); }}>生成する</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RemittanceDetailModal({remittance, data, onClose}) {
+  const r = remittance;
+  const ownerBldgIds = (data.building||[]).filter(b => b.ownerId === r.ownerId).map(b => b.id);
+  const ownerRoomIds = (data.room||[]).filter(rm => ownerBldgIds.includes(rm.buildingId)).map(rm => rm.id);
+  const ownerContractIds = (data.contract||[]).filter(c => ownerRoomIds.includes(c.roomId)).map(c => c.id);
+  const monthBs = (data.billing||[]).filter(b => b.year === r.year && b.month === r.month && ownerContractIds.includes(b.contractId));
+  const ymStart = `${r.year}-${String(r.month).padStart(2,"0")}-01`;
+  const _lastDay = new Date(r.year, r.month, 0).getDate();
+  const ymEnd = `${r.year}-${String(r.month).padStart(2,"0")}-${String(_lastDay).padStart(2,"0")}`;
+  const monthRepairs = (data.repair||[]).filter(rp => ownerBldgIds.includes(rp.buildingId) && rp.paidBy === "家主負担" && rp.completionDate >= ymStart && rp.completionDate <= ymEnd);
+  return (
+    <div className="modal-backdrop" onClick={(e) => { if(e.target === e.currentTarget) onClose(); }}>
+      <div className="modal lg">
+        <div className="modal-head"><div><div className="modal-kicker">Remittance Detail</div><div className="modal-title">{refLabel(data,"owner",r.ownerId)} - {r.year}年{r.month}月 送金明細</div></div><button className="modal-close" onClick={onClose}>×</button></div>
+        <div className="modal-body">
+          <div className="form-section-title">入金明細</div>
+          {monthBs.length === 0 ? <div className="muted" style={{padding:8, fontSize:12}}>該当月の入金なし</div> : (
+            <table className="data" style={{marginBottom:20}}>
+              <thead><tr><th>契約</th><th>請求額</th><th>入金額</th><th>状態</th></tr></thead>
+              <tbody>
+                {monthBs.map(b => (
+                  <tr key={b.id}>
+                    <td>{refLabel(data,"contract",b.contractId)}</td>
+                    <td className="col-num">{fmtMoney(b.totalAmount)}</td>
+                    <td className="col-num">{fmtMoney(b.paidAmount)}</td>
+                    <td>{b.status}</td>
+                  </tr>
+                ))}
+                <tr className="total-row"><td>入金合計</td><td></td><td className="col-num">{fmtMoney(r.totalRentReceived)}</td><td></td></tr>
+              </tbody>
+            </table>
+          )}
+          <div className="form-section-title">家主負担修繕</div>
+          {monthRepairs.length === 0 ? <div className="muted" style={{padding:8, fontSize:12}}>該当月の家主負担修繕なし</div> : (
+            <table className="data" style={{marginBottom:20}}>
+              <thead><tr><th>完了日</th><th>建物</th><th>業者</th><th>内容</th><th>費用</th></tr></thead>
+              <tbody>
+                {monthRepairs.map(rp => (
+                  <tr key={rp.id}>
+                    <td className="tabular">{fmtDate(rp.completionDate)}</td>
+                    <td>{refLabel(data,"building",rp.buildingId)}</td>
+                    <td>{refLabel(data,"vendor",rp.vendorId)}</td>
+                    <td>{rp.workContent}</td>
+                    <td className="col-num">{fmtMoney(rp.cost)}</td>
+                  </tr>
+                ))}
+                <tr className="total-row"><td colSpan={4}>修繕費合計</td><td className="col-num">{fmtMoney(r.repairs)}</td></tr>
+              </tbody>
+            </table>
+          )}
+          <div className="form-section-title">送金額計算</div>
+          <div className="kv-grid">
+            <dt>入金合計</dt><dd>{fmtMoney(r.totalRentReceived)}</dd>
+            <dt>管理手数料 ({r.managementFeeRate}%)</dt><dd style={{color:"var(--danger)"}}>− {fmtMoney(r.managementFee)}</dd>
+            <dt>家主負担修繕費</dt><dd style={{color:"var(--danger)"}}>− {fmtMoney(r.repairs)}</dd>
+            <dt style={{fontSize:13, color:"var(--ink)", fontWeight:600}}>送金額</dt><dd style={{fontSize:18, color:"var(--success)", fontWeight:700, fontFamily:'"Noto Serif JP", serif'}}>{fmtMoney(r.netAmount)}</dd>
+          </div>
+        </div>
+        <div className="modal-foot"><button className="btn" onClick={onClose}>閉じる</button></div>
+      </div>
+    </div>
+  );
+}
+
+/* ==========================================================================
+   Mount
+   ========================================================================== */
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+
