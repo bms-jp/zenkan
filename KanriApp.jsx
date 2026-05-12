@@ -1135,28 +1135,9 @@ function App() {
     }
   }, [data]);
 
-  // ロード中・エラー画面
-  if(loadError) {
-    return (
-      <div style={{padding:40, fontFamily:"sans-serif"}}>
-        <h2 style={{color:"#9c3a30"}}>データ読込エラー</h2>
-        <p>{loadError}</p>
-        <p>ブラウザを再起動するか、別のブラウザでお試しください。</p>
-      </div>
-    );
-  }
-  if(!data) {
-    return (
-      <div style={{display:"flex", alignItems:"center", justifyContent:"center", minHeight:"100vh", fontFamily:"Noto Serif JP, serif"}}>
-        <div style={{textAlign:"center"}}>
-          <div style={{fontSize:40, color:"#9c3a30", marginBottom:12, letterSpacing:"0.3em"}}>賃</div>
-          <div style={{fontSize:14, color:"#8a8278"}}>データを読み込んでいます…</div>
-        </div>
-      </div>
-    );
-  }
-
+  // Rules of Hooks: 全 hook を早期リターンより前に配置
   const counts = useMemo(() => {
+    if(!data) return {};
     const c = {};
     [...ENTITY_ORDER, ...Object.keys(OPS), "billing", "remittance"].forEach(k => c[k] = (data[k]||[]).length);
     return c;
@@ -1302,6 +1283,27 @@ function App() {
   const handleSettingsChange = useCallback((next) => {
     setData(prev => addAudit({...prev, settings:next}, "update", "設定", "システム設定を更新"));
   }, []);
+
+  // ロード中・エラー画面（全 hook の後に置く — Rules of Hooks）
+  if(loadError) {
+    return (
+      <div style={{padding:40, fontFamily:"sans-serif"}}>
+        <h2 style={{color:"#9c3a30"}}>データ読込エラー</h2>
+        <p>{loadError}</p>
+        <p>ブラウザを再起動するか、別のブラウザでお試しください。</p>
+      </div>
+    );
+  }
+  if(!data) {
+    return (
+      <div style={{display:"flex", alignItems:"center", justifyContent:"center", minHeight:"100vh", fontFamily:"Noto Serif JP, serif"}}>
+        <div style={{textAlign:"center"}}>
+          <div style={{fontSize:40, color:"#9c3a30", marginBottom:12, letterSpacing:"0.3em"}}>賃</div>
+          <div style={{fontSize:14, color:"#8a8278"}}>データを読み込んでいます…</div>
+        </div>
+      </div>
+    );
+  }
 
   const seedSampleData = () => {
     if(!confirm("サンプルデータを投入します。よろしいですか？")) return;
@@ -2047,7 +2049,7 @@ function AnalyticsPage({data}) {
   const repairByCategory = useMemo(() => {
     const map = {};
     for(const r of data.repair||[]) {
-      const v = data.vendor.find(x => x.id === r.vendorId);
+      const v = (data.vendor||[]).find(x => x.id === r.vendorId);
       const cat = v ? v.category : "未設定";
       map[cat] = (map[cat] || 0) + (Number(r.cost)||0);
     }
@@ -2201,7 +2203,7 @@ function AccountingExportPage({data}) {
     // 入金 (賃料収入)
     for(const p of data.payment||[]) {
       if(p.paidDate >= from && p.paidDate <= to) {
-        const billing = data.billing.find(b => b.id === p.billingId);
+        const billing = (data.billing||[]).find(b => b.id === p.billingId);
         const contractRef = billing ? refLabel(data,"contract",billing.contractId) : "";
         out.push({
           date: p.paidDate, debit:"現金預金", credit:"売上高（賃料収入）",
@@ -2213,7 +2215,7 @@ function AccountingExportPage({data}) {
     for(const v of data.vendorPayment||[]) {
       if(v.status !== "支払済" || !v.paidDate) continue;
       if(v.paidDate >= from && v.paidDate <= to) {
-        const cat = (data.vendor.find(x => x.id === v.vendorId) || {}).category || "";
+        const cat = ((data.vendor||[]).find(x => x.id === v.vendorId) || {}).category || "";
         const account = cat === "清掃" ? "清掃費" : (cat === "修繕" || cat.includes("工事")) ? "修繕費" : "外注費";
         out.push({
           date: v.paidDate, debit:account, credit:"現金預金",
@@ -3240,17 +3242,16 @@ function BuildingDetailPage({data, buildingId, onBack, onEditBuilding, onNav}) {
   const monthBilled = thisMonthBillings.reduce((s, b) => s + (Number(b.totalAmount)||0), 0);
   const monthReceived = thisMonthBillings.reduce((s, b) => s + (Number(b.paidAmount)||0), 0);
 
-  // Yearly revenue (last 12 months)
-  const yearlyRevenue = useMemo(() => {
+  // Yearly revenue (last 12 months) — plain variable (no useMemo: this is after an early return)
+  let yearlyRevenue = 0;
+  {
     const now = new Date();
-    let total = 0;
     for(let i = 0; i < 12; i++){
       const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
       const y = d.getFullYear(), m = d.getMonth() + 1;
-      total += billings.filter(b => b.year === y && b.month === m).reduce((s, b) => s + (Number(b.paidAmount)||0), 0);
+      yearlyRevenue += billings.filter(b => b.year === y && b.month === m).reduce((s, b) => s + (Number(b.paidAmount)||0), 0);
     }
-    return total;
-  }, [billings]);
+  }
 
   // Expected monthly rent
   const expectedRent = activeContracts.reduce((s, c) => s + (Number(c.rent)||0) + (Number(c.fee)||0), 0);
@@ -3536,10 +3537,10 @@ function SettingsPage({data, onChange}) {
         <div className="card-head"><div className="card-head-title">データ管理</div></div>
         <div className="card-body">
           <div className="banner info" style={{marginBottom:14}}>
-            データはブラウザのlocalStorageに保存されています。<strong>ブラウザのデータ削除やプライベートモード切替で全消失します</strong>。定期的にJSONバックアップを取得してください。
+            データはブラウザのIndexedDBに保存されています。<strong>ブラウザのデータ削除やプライベートモード切替で全消失します</strong>。定期的にJSONバックアップを取得してください。
           </div>
           <div className="kv-grid" style={{marginBottom:14}}>
-            <dt>現在使用量</dt><dd className="tabular">{(getStorageUsage(data)/1024).toFixed(1)} KB <span className="muted" style={{fontSize:11}}>（目安: 5〜10MB上限）</span></dd>
+            <dt>現在使用量</dt><dd className="tabular">{(getStorageUsage(data)/1024).toFixed(1)} KB <span className="muted" style={{fontSize:11}}>（IndexedDB: 数百MB〜数GB利用可）</span></dd>
             <dt>登録件数（合計）</dt><dd className="tabular">{[...ENTITY_ORDER, ...OPS_ORDER, "billing", "payment", "remittance"].reduce((s,k) => s + ((data[k]||[]).length), 0)} 件</dd>
             <dt>操作ログ</dt><dd className="tabular">{(data.auditLog||[]).length} 件 <span className="muted" style={{fontSize:11}}>（1000件超は古い順に自動削除）</span></dd>
           </div>
