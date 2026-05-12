@@ -907,24 +907,6 @@ table.data tr.total-row td {
 </head>
 <body>
 <div id="root"></div>
-<div id="error-display" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:#fff;padding:30px;overflow:auto;z-index:9999;font-family:monospace;font-size:13px;color:#c00"></div>
-<script>
-(function() {
-  var errDiv = document.getElementById('error-display');
-  function show(msg) { errDiv.style.display='block'; errDiv.innerText += msg + '\n\n'; }
-  window.onerror = function(msg, src, line, col, err) {
-    show('ERROR: ' + msg + '\nLine: ' + line + (err ? '\n' + err.stack : ''));
-  };
-  window.addEventListener('unhandledrejection', function(e) {
-    show('PROMISE REJECTION: ' + (e.reason ? e.reason.stack || e.reason : e));
-  });
-  var origError = console.error.bind(console);
-  console.error = function() {
-    origError.apply(console, arguments);
-    show('console.error: ' + Array.from(arguments).join(' '));
-  };
-})();
-</script>
 <script type="text/babel">
 const { useState, useEffect, useMemo, useCallback, useRef } = React;
 
