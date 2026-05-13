@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Kanri System — 賃貸管理</title>
+<title>ZENKAN — 賃貸管理</title>
 
 <!-- ====== Security Hardening ======
   CSP: defense-in-depth against XSS / clickjacking / mixed content.
@@ -47,7 +47,7 @@
 
 <style>
 /* ============================================================
-   Kanri System V3 — Clear SaaS Design
+   ZENKAN V3 — Clear SaaS Design
    Compatible with V2.2 class names (no JSX changes required)
    ============================================================ */
 
@@ -955,7 +955,7 @@ function filterWithLimit(items, predicate, maxHits = 500) {
 }
 
 /* ==========================================================================
-   賃貸管理システム ― Kanri V2
+   賃貸管理システム ― ZENKAN V2
    ========================================================================== */
 
 const LS_KEY = "kanri_v2_data";
@@ -2045,6 +2045,23 @@ function App() {
     }
   }, [data]);
 
+  // 解約予定の自動実行: 解約日が到来した契約を自動的に解約済にする
+  useEffect(() => {
+    if(!data) return;
+    const today = todayLocal();
+    const due = (data.contract||[]).filter(c => c.status === "解約予定" && c.terminationDate && c.terminationDate <= today);
+    if(due.length === 0) return;
+    setData(prev => {
+      let next = {...prev, contract:[...prev.contract], room:[...prev.room]};
+      due.forEach(c => {
+        next.contract = next.contract.map(x => x.id === c.id ? {...x, status:"解約済"} : x);
+        if(c.roomId) next.room = next.room.map(r => r.id === c.roomId ? {...r, status:"空室"} : r);
+        next = addAudit(next, "auto_terminate", "契約", `契約「${c.contractNo}」を自動解約（予定日: ${c.terminationDate}）`);
+      });
+      return next;
+    });
+  }, [data?.contract?.length]);
+
   // Rules of Hooks: 全 hook を早期リターンより前に配置
   const counts = useMemo(() => {
     if(!data) return {};
@@ -2113,9 +2130,17 @@ function App() {
     setData(prev => {
       const orig = prev.contract.find(c => c.id === contractId);
       if(!orig) return prev;
-      const updated = prev.contract.map(c => c.id === contractId ? {...c, status:"解約済", ...termData} : c);
-      const updatedRooms = prev.room.map(r => r.id === orig.roomId ? {...r, status:"空室"} : r);
-      return addAudit({...prev, contract:updated, room:updatedRooms}, "terminate", "契約", `契約「${orig.contractNo}」を解約（${termData.terminationDate}）`);
+      const today = todayLocal();
+      if(termData.terminationDate <= today) {
+        // 解約日が今日以前 → 即時解約
+        const updated = prev.contract.map(c => c.id === contractId ? {...c, status:"解約済", ...termData} : c);
+        const updatedRooms = prev.room.map(r => r.id === orig.roomId ? {...r, status:"空室"} : r);
+        return addAudit({...prev, contract:updated, room:updatedRooms}, "terminate", "契約", `契約「${orig.contractNo}」を解約（${termData.terminationDate}）`);
+      } else {
+        // 解約日が未来 → 解約予定にする
+        const updated = prev.contract.map(c => c.id === contractId ? {...c, status:"解約予定", ...termData} : c);
+        return addAudit({...prev, contract:updated}, "schedule_terminate", "契約", `契約「${orig.contractNo}」を解約予定（${termData.terminationDate}）`);
+      }
     });
     setWorkflow(null);
   }, []);
@@ -2286,7 +2311,7 @@ function App() {
           </div>
         )}
         {renderView()}
-        <div className="footer-credit">Kanri System · V3 · IndexedDB</div>
+        <div className="footer-credit">ZENKAN · V3 · IndexedDB</div>
       </main>
 
       {/* 保存状態インジケータ (右下) */}
@@ -2313,7 +2338,7 @@ function Sidebar({view, setView, counts, data}) {
   return (
     <aside className="sidebar">
       <div className="brand">
-        <div className="brand-mark">Kanri System</div>
+        <div className="brand-mark">ZENKAN</div>
         <div className="brand-title">賃貸管理</div>
         <div className="brand-subtitle">RENTAL ADMIN · V2</div>
       </div>
@@ -2682,7 +2707,7 @@ function ContractPage({data, setEditing, setConfirmDelete, setWorkflow}) {
                 <td className="col-actions">
                   {c.status === "契約中" && (<>
                     <button className="btn btn-sm btn-success" onClick={() => setWorkflow({kind:"renew", payload:c})}>更新</button>
-                    <button className="btn btn-sm" onClick={() => setWorkflow({kind:"terminate", payload:c})}>解約</button>
+                    <button className="btn btn-sm" onClick={() => setWorkflow({kind:"terminate", payload:c})}>解約予定</button>
                   </>)}
                   <button className="btn btn-sm btn-ghost" onClick={() => setEditing({entity:"contract", item:c})}>編集</button>
                   <button className="btn btn-sm btn-ghost btn-danger" onClick={() => setConfirmDelete({entity:"contract", id:c.id, label:c.contractNo})}>削除</button>
@@ -4467,7 +4492,7 @@ function SettingsPage({data, onChange}) {
                   try {
                     const parsed = JSON.parse(ev.target.result);
                     if(!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !Array.isArray(parsed.owner)) {
-                      alert("ファイルの形式が不正です。Kanri Systemのバックアップファイル(JSON)を指定してください。");
+                      alert("ファイルの形式が不正です。ZENKANのバックアップファイル(JSON)を指定してください。");
                       return;
                     }
                     if(!confirm(`既存データを置き換えます。\n\n復元元: ${f.name}\n物件数: ${(parsed.building||[]).length} 棟 / 部屋: ${(parsed.room||[]).length} 室\n\nこの操作は元に戻せません。続行しますか？`)) return;
@@ -4740,9 +4765,9 @@ function TerminateContractModal({contract, onClose, onConfirm}) {
   return (
     <div className="modal-backdrop" onClick={(e) => { if(e.target === e.currentTarget) onClose(); }}>
       <div className="modal">
-        <div className="modal-head"><div><div className="modal-kicker">Terminate Contract</div><div className="modal-title">契約解約</div></div><button className="modal-close" onClick={onClose}>×</button></div>
+        <div className="modal-head"><div><div className="modal-kicker">Schedule Termination</div><div className="modal-title">解約予定</div></div><button className="modal-close" onClick={onClose}>×</button></div>
         <div className="modal-body">
-          <div className="banner warn">契約「{contract.contractNo}」({contract.tenantName}) を解約します。対象部屋は「空室」になります。</div>
+          <div className="banner warn">契約「{contract.contractNo}」({contract.tenantName}) の解約を予定します。解約日が到来すると自動的に解約され、対象部屋は「空室」になります。</div>
           <div className="form-grid">
             <div className="form-field"><label className="form-label">解約日 <span className="req">●</span></label><input className="form-input" type="date" value={form.terminationDate} onChange={e => setForm({...form, terminationDate:e.target.value})} /></div>
             <div className="form-field"><label className="form-label">原状回復費 (円)</label><input className="form-input" type="number" value={form.restorationCost} onChange={e => setForm({...form, restorationCost:Number(e.target.value)})} /></div>
@@ -4754,7 +4779,7 @@ function TerminateContractModal({contract, onClose, onConfirm}) {
         </div>
         <div className="modal-foot">
           <button className="btn" onClick={onClose}>キャンセル</button>
-          <button className="btn btn-primary" onClick={() => onConfirm(form)} disabled={!form.terminationDate}>解約する</button>
+          <button className="btn btn-primary" onClick={() => onConfirm(form)} disabled={!form.terminationDate}>解約予定にする</button>
         </div>
       </div>
     </div>
