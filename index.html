@@ -972,12 +972,17 @@ table.data tr.total-row td {
 <body>
 <div id="root"></div>
 <!-- Supabase JS v2 -->
-<script src="https://unpkg.com/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+<script src="https://unpkg.com/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 <script>
 (function() {
   var SUPABASE_URL  = "https://oevvudsozznqforurezm.supabase.co";
   var SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9ldnZ1ZHNvenpucWZvcnVyZXptIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg5MTg1MjksImV4cCI6MjA5NDQ5NDUyOX0.rwQMJDfb5XbRAB-i0PX8Z-HOxidcoCkDEWpSnkcWfts";
-  window._supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON);
+  try {
+    window._supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON);
+  } catch(e) {
+    console.error('[Kanri] Supabase init failed:', e.message);
+    window._supabase = null;
+  }
 })();
 </script>
 <script type="text/babel">
@@ -1035,9 +1040,22 @@ function AuthGate() {
   const [session, setSession] = useState(undefined); // undefined=確認中
 
   useEffect(() => {
-    supabaseClient.auth.getSession().then(({ data: { session } }) => setSession(session));
-    const { data: { subscription } } = supabaseClient.auth.onAuthStateChange((_e, s) => setSession(s));
-    return () => subscription.unsubscribe();
+    if (!supabaseClient) {
+      console.warn('[Kanri] Supabase client unavailable — showing login screen offline');
+      setSession(null);
+      return;
+    }
+    let sub = null;
+    supabaseClient.auth.getSession()
+      .then(function(res) { setSession(res.data.session); })
+      .catch(function(e) { console.error('[Kanri] getSession error:', e); setSession(null); });
+    try {
+      var listener = supabaseClient.auth.onAuthStateChange(function(_e, s) { setSession(s); });
+      sub = listener.data.subscription;
+    } catch(e) {
+      console.error('[Kanri] onAuthStateChange error:', e);
+    }
+    return function() { if (sub) sub.unsubscribe(); };
   }, []);
 
   if (session === undefined) return (
