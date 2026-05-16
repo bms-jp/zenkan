@@ -1274,6 +1274,179 @@ function saveAll(d){ saveAllAsync(d); return true; }
 // Approximate storage usage (still JSON-based estimate since IDB doesn't expose size cheaply)
 function getStorageUsage(d){ try { return new Blob([JSON.stringify(d)]).size; } catch { return 0; } }
 
+/* ==========================================================================
+   Phase 1 — Supabase 永続化層
+   IndexedDB と並行して Supabase にも読み書きする
+   ========================================================================== */
+const SB_TABLE = {
+  owner:"owners", building:"buildings", room:"rooms", tenant:"tenants",
+  vendor:"vendors", application:"applications", contract:"contracts",
+  billing:"billings", payment:"payments", remittance:"remittances",
+  vendorPayment:"vendor_payments", ticket:"tickets", repair:"repairs",
+  construction:"constructions", auditLog:"audit_logs",
+};
+const SB_LABELS = {
+  owner:"家主", building:"建物", room:"部屋", tenant:"契約者", vendor:"取引業者",
+  application:"申込", contract:"契約", billing:"請求", payment:"入金",
+  remittance:"送金", vendorPayment:"業者支払", ticket:"チケット",
+  repair:"修繕", construction:"工事", auditLog:"監査ログ",
+};
+
+function _toSnake(s){ return s.replace(/([A-Z])/g, '_$1').toLowerCase(); }
+function _toCamel(s){ return s.replace(/_([a-z])/g, (_, c) => c.toUpperCase()); }
+const _SB_SKIP = new Set(['organization_id','created_at','updated_at']);
+
+function _rowToDb(obj, orgId){
+  const out = {organization_id: orgId};
+  for(const [k, v] of Object.entries(obj)){
+    if(k === 'organization_id') continue;
+    const dbKey = (k === 'id') ? 'id' : _toSnake(k);
+    out[dbKey] = (v === undefined || v === '') ? null : v;
+  }
+  return out;
+}
+
+function _rowFromDb(row){
+  const out = {};
+  for(const [k, v] of Object.entries(row)){
+    if(_SB_SKIP.has(k)) continue;
+    if(v !== null && v !== undefined) out[_toCamel(k)] = v;
+  }
+  return out;
+}
+
+let _cachedOrgId = null;
+
+async function _ensureOrgId(){
+  if(_cachedOrgId) return _cachedOrgId;
+  if(!supabaseClient) return null;
+  try {
+    const {data, error} = await supabaseClient
+      .from('members').select('organization_id').limit(1);
+    if(!error && data && data.length > 0){
+      _cachedOrgId = data[0].organization_id;
+      return _cachedOrgId;
+    }
+    // 初回ログイン: 組織を新規作成
+    const {data: orgId, error: ce} = await supabaseClient
+      .rpc('create_organization', {p_name: '管理会社'});
+    if(ce){ console.error('[Kanri] create_organization failed:', ce); return null; }
+    _cachedOrgId = orgId;
+    return _cachedOrgId;
+  } catch(e){ console.error('[Kanri] _ensureOrgId failed:', e); return null; }
+}
+
+async function loadFromSupabase(){
+  if(!supabaseClient) return null;
+  try {
+    const orgId = await _ensureOrgId();
+    if(!orgId) return null;
+
+    const result = {};
+    for(const [entityKey, tableName] of Object.entries(SB_TABLE)){
+      const {data, error} = await supabaseClient
+        .from(tableName).select('*').eq('organization_id', orgId);
+      result[entityKey] = error ? [] : (data||[]).map(_rowFromDb);
+      if(error) console.warn(`[Kanri] Supabase load (${tableName}):`, error.message);
+    }
+
+    // settings は organization_id が PK で列名が snake_case
+    const {data: sRow, error: sErr} = await supabaseClient
+      .from('settings').select('*').eq('organization_id', orgId).single();
+    if(!sErr && sRow){
+      result.settings = {
+        ...DEFAULT_SETTINGS,
+        companyName:       sRow.company_name       || DEFAULT_SETTINGS.companyName,
+        defaultDueDay:     sRow.default_due_day    || DEFAULT_SETTINGS.defaultDueDay,
+        managementFeeRate: sRow.management_fee_rate != null ? Number(sRow.management_fee_rate) : DEFAULT_SETTINGS.managementFeeRate,
+        aiEnabled:         sRow.ai_enabled         ?? DEFAULT_SETTINGS.aiEnabled,
+        aiEndpoint:        sRow.ai_endpoint        || DEFAULT_SETTINGS.aiEndpoint,
+        aiApiKey:          sRow.ai_api_key_encrypted || DEFAULT_SETTINGS.aiApiKey,
+        aiModel:           sRow.ai_model           || DEFAULT_SETTINGS.aiModel,
+        aiAuthMode:        sRow.ai_auth_mode       || DEFAULT_SETTINGS.aiAuthMode,
+        aiMaxTokens:       sRow.ai_max_tokens      || DEFAULT_SETTINGS.aiMaxTokens,
+        ...(sRow.extra || {}),
+      };
+    }
+
+    return result;
+  } catch(e){ console.error('[Kanri] loadFromSupabase failed:', e); return null; }
+}
+
+async function _sbUpsert(tableName, rows){
+  if(!rows || rows.length === 0) return {n: 0, error: null};
+  const {error} = await supabaseClient
+    .from(tableName).upsert(rows, {onConflict:'id'});
+  if(error) console.error(`[Kanri] Supabase upsert (${tableName}):`, error.message);
+  return {n: error ? -1 : rows.length, error};
+}
+
+async function _sbSaveSettings(settings, orgId){
+  const {error} = await supabaseClient.from('settings').upsert({
+    organization_id:       orgId,
+    company_name:          settings.companyName          || null,
+    default_due_day:       settings.defaultDueDay         || 27,
+    management_fee_rate:   settings.managementFeeRate     || 5,
+    ai_enabled:            settings.aiEnabled             ?? false,
+    ai_endpoint:           settings.aiEndpoint            || null,
+    ai_api_key_encrypted:  settings.aiApiKey              || null,
+    ai_model:              settings.aiModel               || 'claude-sonnet-4-6',
+    ai_auth_mode:          settings.aiAuthMode            || 'direct',
+    ai_max_tokens:         settings.aiMaxTokens           || 4096,
+  }, {onConflict:'organization_id'});
+  if(error) console.error('[Kanri] Supabase settings upsert:', error.message);
+}
+
+// 全エンティティを Supabase に一括 UPSERT（Phase 4 の同期ボタン用）
+async function syncAllToSupabase(data, onProgress){
+  if(!supabaseClient) return {success:false, reason:'no_client'};
+  const orgId = await _ensureOrgId();
+  if(!orgId) return {success:false, reason:'no_org'};
+
+  const results = {};
+  const keys = Object.keys(SB_TABLE);
+  for(let i = 0; i < keys.length; i++){
+    const entityKey = keys[i];
+    const tableName = SB_TABLE[entityKey];
+    if(onProgress) onProgress({entityKey, index:i, total:keys.length});
+    const items = data[entityKey] || [];
+    if(items.length === 0){ results[entityKey] = 0; continue; }
+    const rows = items.map(item => _rowToDb(item, orgId));
+    // Supabase の upsert はデフォルト1000件上限。バッチ分割
+    let total = 0;
+    for(let j = 0; j < rows.length; j += 500){
+      const {n} = await _sbUpsert(tableName, rows.slice(j, j+500));
+      total += Math.max(n, 0);
+    }
+    results[entityKey] = total;
+  }
+  await _sbSaveSettings(data.settings, orgId);
+  results.settings = 1;
+  return {success:true, results, orgId};
+}
+
+// 差分のみ Supabase に書く（data が変わるたびに呼ばれる background sync）
+let _prevSyncedData = null;
+async function _bgSyncToSupabase(curr){
+  if(!supabaseClient || !_cachedOrgId) return;
+  const prev = _prevSyncedData;
+  _prevSyncedData = curr;
+  if(!prev) return; // 初回ロード直後はスキップ（full sync か手動 sync を使う）
+
+  const promises = [];
+  for(const entityKey of Object.keys(SB_TABLE)){
+    if(curr[entityKey] !== prev[entityKey]){
+      const rows = (curr[entityKey]||[]).map(item => _rowToDb(item, _cachedOrgId));
+      // 削除は未対応（削除はIDB側のみ; 完全反映は sync ボタンで）
+      if(rows.length > 0) promises.push(_sbUpsert(SB_TABLE[entityKey], rows).catch(e=>console.error('[Kanri] bg sync',entityKey,e)));
+    }
+  }
+  if(curr.settings !== prev.settings){
+    promises.push(_sbSaveSettings(curr.settings, _cachedOrgId).catch(e=>console.error('[Kanri] bg sync settings',e)));
+  }
+  if(promises.length > 0) await Promise.all(promises);
+}
+
 // CSV-safe cell escaper: prevents CSV injection (=,+,-,@,\t,\r prefix) AND quotes commas/newlines/quotes
 function csvCell(v){
   if(v == null) return "";
@@ -2608,20 +2781,50 @@ function App({ session }) {
   const [saveState, setSaveState] = useState("idle"); // idle | saving | ok | error
   const isFirstSave = React.useRef(true);
 
-  // 起動時の非同期ロード（IndexedDB → 旧 localStorage からの自動移行）
+  // Phase 2: 起動時ロード（Supabase優先 → IndexedDB フォールバック）
   useEffect(() => {
     let cancelled = false;
-    loadAllAsync().then(d => { if(!cancelled) setData(d); }).catch(e => { if(!cancelled) setLoadError(e.message || String(e)); });
+    const load = async () => {
+      try {
+        _cachedOrgId = null; // ログイン切替時にキャッシュをリセット
+        let d = null;
+
+        if(session && supabaseClient){
+          const sbData = await loadFromSupabase();
+          if(sbData){
+            const totalSbRecords = Object.keys(SB_TABLE).reduce((s,k) => s+(sbData[k]?.length||0), 0);
+            if(totalSbRecords === 0){
+              // Supabase が空 → IDB のデータをロード（移行前の初回）
+              const idbData = await loadAllAsync();
+              d = _validateData(idbData);
+            } else {
+              d = _validateData(sbData);
+            }
+            _prevSyncedData = d; // bg sync の基準点を初期化
+          }
+        }
+
+        if(!d) d = await loadAllAsync(); // IDB フォールバック
+        if(!cancelled) setData(d);
+      } catch(e){
+        if(!cancelled) setLoadError(e.message || String(e));
+      }
+    };
+    load();
     return () => { cancelled = true; };
   }, []);
 
-  // データ変更時の非同期保存（デバウンス500ms）
+  // Phase 3: データ変更時の非同期保存（IDB + Supabase 二重書き込み）
   useEffect(() => {
     if(!data) return;
     if(isFirstSave.current) { isFirstSave.current = false; return; } // 初回ロード直後の保存をスキップ
     setSaveState("saving");
     window.__kanriSaveListener = (status) => setSaveState(status);
-    saveAllAsync(data);
+    saveAllAsync(data); // IDB は必ず保存
+    // Supabase: 差分のみ fire-and-forget（失敗してもIDBは保存済み）
+    if(session && supabaseClient && _cachedOrgId){
+      _bgSyncToSupabase(data).catch(e => console.error('[Kanri] Supabase bg sync failed:', e));
+    }
     return () => { window.__kanriSaveListener = null; };
   }, [data]);
 
@@ -5116,6 +5319,88 @@ function BuildingDetailPage({data, buildingId, onBack, onEditBuilding, onNav}) {
 }
 
 /* ==========================================================================
+   Phase 4 — Supabase 同期セクション
+   ========================================================================== */
+function SupabaseSyncSection({data}) {
+  const [syncing, setSyncing]   = useState(false);
+  const [results, setResults]   = useState(null);
+  const [progress, setProgress] = useState(null);
+  const [error, setError]       = useState("");
+
+  if(!supabaseClient) return null;
+
+  const doSync = async () => {
+    setSyncing(true);
+    setError("");
+    setResults(null);
+    setProgress({entityKey:"...", index:0, total:Object.keys(SB_TABLE).length});
+    try {
+      const result = await syncAllToSupabase(data, (p) => setProgress(p));
+      if(!result.success){
+        setError("同期失敗: " + (result.reason === 'no_org' ? '組織の作成に失敗しました' : result.reason));
+      } else {
+        setResults(result.results);
+      }
+    } catch(e){
+      setError("同期エラー: " + e.message);
+    } finally {
+      setSyncing(false);
+      setProgress(null);
+    }
+  };
+
+  const totalLocal = Object.keys(SB_TABLE).reduce((s,k) => s+(data[k]?.length||0), 0);
+
+  return (
+    <div className="card">
+      <div className="card-head"><div className="card-head-title">☁️ Supabase 同期</div></div>
+      <div className="card-body">
+        <div className="banner info" style={{marginBottom:14, fontSize:12, lineHeight:1.6}}>
+          IndexedDB のデータを Supabase に一括 UPSERT します。<strong>初回は必ずこれを実行</strong>してください。以降は編集時に自動で同期されます。<br/>
+          ローカル件数: <strong>{totalLocal} 件</strong>
+        </div>
+
+        {error && <div className="login-error" style={{marginBottom:12}}>{error}</div>}
+
+        {syncing && progress && (
+          <div style={{marginBottom:12}}>
+            <div style={{fontSize:12, color:"var(--muted)", marginBottom:6}}>
+              同期中... ({progress.index + 1} / {progress.total}) — {SB_LABELS[progress.entityKey] || progress.entityKey}
+            </div>
+            <div style={{background:"var(--surface-hover)", borderRadius:4, height:6, overflow:"hidden"}}>
+              <div style={{background:"var(--accent)", height:"100%", width:`${Math.round((progress.index+1)/progress.total*100)}%`, transition:"width .2s"}} />
+            </div>
+          </div>
+        )}
+
+        {results && (
+          <div style={{marginBottom:16}}>
+            <div className="banner success" style={{marginBottom:8}}>同期完了</div>
+            <div style={{display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(140px,1fr))", gap:4}}>
+              {Object.entries(results).map(([key, n]) => {
+                if(key === 'settings') return null;
+                const label = SB_LABELS[key] || key;
+                const icon = n < 0 ? '❌' : '✅';
+                return (
+                  <div key={key} style={{fontSize:12, padding:"3px 6px", borderRadius:4, background:"var(--surface-hover)"}}>
+                    {icon} {label}: {n < 0 ? 'エラー' : `${n}件`}
+                  </div>
+                );
+              })}
+              <div style={{fontSize:12, padding:"3px 6px", borderRadius:4, background:"var(--surface-hover)"}}>✅ 設定: 1件</div>
+            </div>
+          </div>
+        )}
+
+        <button className="btn btn-primary" onClick={doSync} disabled={syncing}>
+          {syncing ? "同期中..." : "☁️ Supabase に今すぐ同期"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ==========================================================================
    CSV Import Section
    ========================================================================== */
 const CSV_IMPORT_ENTITIES = [
@@ -5558,6 +5843,7 @@ function SettingsPage({data, onChange, onBulkImport}) {
           </div>
         </div>
       </div>
+      <SupabaseSyncSection data={data} />
       <CsvImportSection data={data} onBulkImport={onBulkImport} />
     </>
   );
