@@ -5053,7 +5053,7 @@ function SettingsPage({data, onChange}) {
           </div>
           <div className="kv-grid" style={{marginBottom:14}}>
             <dt>現在使用量</dt><dd className="tabular">{(getStorageUsage(data)/1024).toFixed(1)} KB <span className="muted" style={{fontSize:11}}>（目安: 5〜10MB上限）</span></dd>
-            <dt>登録件数（合計）</dt><dd className="tabular">{[...ENTITY_ORDER, ...OPS_ORDER, "billing", "payment", "remittance"].reduce((s,k) => s + ((data[k]||[]).length), 0)} 件</dd>
+            <dt>登録件数（合計）</dt><dd className="tabular">{[...ENTITY_ORDER, ...Object.keys(OPS), "billing", "payment", "remittance"].reduce((s,k) => s + ((data[k]||[]).length), 0)} 件</dd>
             <dt>操作ログ</dt><dd className="tabular">{(data.auditLog||[]).length} 件 <span className="muted" style={{fontSize:11}}>（1000件超は古い順に自動削除）</span></dd>
           </div>
           <div style={{display:"flex", gap:8, flexWrap:"wrap"}}>
