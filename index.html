@@ -961,12 +961,12 @@ function filterWithLimit(items, predicate, maxHits = 500) {
 const LS_KEY = "kanri_v2_data";
 const DEFAULT_SETTINGS = {
   companyName: "○○管理株式会社", managementFeeRate: 5, consumptionTaxRate: 10, defaultDueDay: 27, bankAccount: "",
-  // AI連携 (Claude API直結 / 将来 BMS API Gatewayへスイッチ可能)
-  aiEnabled: false,
-  aiEndpoint: "https://api.anthropic.com/v1/messages",
-  aiApiKey: "",
-  aiModel: "claude-sonnet-4-5",
-  aiAuthMode: "direct", // "direct" = x-api-key (Anthropic直) / "gateway" = Authorization Bearer (BMS Gateway経由)
+  // AI連携 (BMS Gateway経由 / "direct"でAnthropicAPIに切替可)
+  aiEnabled: true,
+  aiEndpoint: "http://localhost:8000/v1/ai/claude/messages",
+  aiApiKey: "REMOVED_API_KEY",
+  aiModel: "claude-sonnet-4-6",
+  aiAuthMode: "gateway",
   aiMaxTokens: 4096,
 };
 const emptyData = () => ({
@@ -1031,8 +1031,17 @@ function _validateData(p){
   const result = {...base};
   for(const k of Object.keys(base)) {
     if(k === "settings") {
-      result.settings = (p.settings && typeof p.settings === "object" && !Array.isArray(p.settings))
+      const merged = (p.settings && typeof p.settings === "object" && !Array.isArray(p.settings))
         ? {...DEFAULT_SETTINGS, ...p.settings} : {...DEFAULT_SETTINGS};
+      // APIキー未設定 or 古いAnthropicデフォルトのまま → BMS Gatewayに自動切替
+      if(!merged.aiApiKey || merged.aiEndpoint === "https://api.anthropic.com/v1/messages") {
+        merged.aiEnabled = true;
+        merged.aiAuthMode = "gateway";
+        merged.aiEndpoint = "http://localhost:8000/v1/ai/claude/messages";
+        merged.aiApiKey = "REMOVED_API_KEY";
+        merged.aiModel = "claude-sonnet-4-6";
+      }
+      result.settings = merged;
     } else {
       // Entity arrays: filter out null/non-object/array elements
       result[k] = Array.isArray(p[k])
@@ -1640,7 +1649,12 @@ async function callClaudeApi(prompt, settings) {
     "anthropic-version": "2023-06-01",
   };
   if(authMode === "gateway") {
-    headers["authorization"] = `Bearer ${apiKey}`;
+    // BMS Gateway: mks_ キーは X-API-Key ヘッダ、at_ トークンは Authorization: Bearer
+    if(apiKey.startsWith("mks_")) {
+      headers["x-api-key"] = apiKey;
+    } else {
+      headers["authorization"] = `Bearer ${apiKey}`;
+    }
   } else {
     headers["x-api-key"] = apiKey;
     headers["anthropic-dangerous-direct-browser-access"] = "true";
@@ -1668,14 +1682,17 @@ async function callClaudeApi(prompt, settings) {
     throw new Error(errMsg);
   }
 
-  const data = await response.json();
-  const text = (data.content || []).filter(c => c.type === "text").map(c => c.text).join("\n");
+  const raw = await response.json();
+  // BMS Gateway は {data: <Anthropic応答>, usage: {input_tokens,output_tokens,charged_jpy}} でラップ
+  const anthropicData = (authMode === "gateway" && raw.data) ? raw.data : raw;
+  const gatewayUsage = (authMode === "gateway" && raw.usage) ? raw.usage : null;
+  const text = (anthropicData.content || []).filter(c => c.type === "text").map(c => c.text).join("\n");
   return {
     text,
-    model: data.model || model,
-    usage: data.usage || {},
-    stopReason: data.stop_reason,
-    raw: data,
+    model: anthropicData.model || model,
+    usage: gatewayUsage || anthropicData.usage || {},
+    stopReason: anthropicData.stop_reason,
+    raw,
   };
 }
 
@@ -5016,7 +5033,7 @@ function SettingsPage({data, onChange}) {
               <label className="form-label">APIキー / アクセストークン <span className="req">●</span></label>
               <input className="form-input" type="password" value={form.aiApiKey||""}
                      onChange={e => setForm({...form, aiApiKey: e.target.value})}
-                     placeholder={form.aiAuthMode === "gateway" ? "BMS Gateway から発行されたアクセストークン" : "sk-ant-api..."} />
+                     placeholder={form.aiAuthMode === "gateway" ? "mks_... (BMS Gateway APIキー) または at_... (アクセストークン)" : "sk-ant-api..."} />
               <div className="form-help">
                 {form.aiAuthMode === "gateway"
                   ? "BMS API Gateway から発行されたアクセストークン (Bearer ヘッダで送信)"
@@ -5034,10 +5051,10 @@ function SettingsPage({data, onChange}) {
             </div>
             <div className="form-field">
               <label className="form-label">最大トークン数</label>
-              <input className="form-input" type="number" min="512" max="32000" step="512"
+              <input className="form-input" type="number" min="512" max="8000" step="512"
                      value={form.aiMaxTokens||4096}
                      onChange={e => setForm({...form, aiMaxTokens: Number(e.target.value)})} />
-              <div className="form-help">レポート出力の上限。長文分析は4096〜8192推奨</div>
+              <div className="form-help">レポート出力の上限（BMS Gateway上限: 8000）。長文分析は4096〜6000推奨</div>
             </div>
           </div>
         </div>
