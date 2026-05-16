@@ -973,6 +973,8 @@ table.data tr.total-row td {
 <div id="root"></div>
 <!-- Supabase JS v2 -->
 <script src="https://unpkg.com/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<!-- PapaParse CSV -->
+<script src="https://unpkg.com/papaparse@5/papaparse.min.js"></script>
 <script>
 (function() {
   var SUPABASE_URL  = "https://oevvudsozznqforurezm.supabase.co";
@@ -2800,6 +2802,16 @@ function App({ session }) {
     setData(prev => addAudit({...prev, settings:next}, "update", "設定", "システム設定を更新"));
   }, []);
 
+  const handleBulkImport = useCallback((entityKey, items) => {
+    setData(prev => {
+      const cfg = ENTITIES[entityKey] || OPS[entityKey];
+      return addAudit(
+        {...prev, [entityKey]: [...(prev[entityKey]||[]), ...items]},
+        "import", cfg?.label||entityKey, `CSVから${cfg?.label||entityKey}を${items.length}件一括登録`
+      );
+    });
+  }, []);
+
   // ロード中・エラー画面（全 hook の後に置く — Rules of Hooks）
   if(loadError) {
     return (
@@ -2876,7 +2888,7 @@ function App({ session }) {
     if(view === "cashflow") return <CashflowPage data={data} onSaveAnalysis={(item) => handleSave("aiAnalysis", item)} />;
     if(view === "accounting") return <AccountingExportPage data={data} />;
     if(view === "auditLog") return <AuditLogPage data={data} />;
-    if(view === "settings") return <SettingsPage data={data} onChange={handleSettingsChange} />;
+    if(view === "settings") return <SettingsPage data={data} onChange={handleSettingsChange} onBulkImport={handleBulkImport} />;
     return null;
   };
 
@@ -5103,7 +5115,285 @@ function BuildingDetailPage({data, buildingId, onBack, onEditBuilding, onNav}) {
   );
 }
 
-function SettingsPage({data, onChange}) {
+/* ==========================================================================
+   CSV Import Section
+   ========================================================================== */
+const CSV_IMPORT_ENTITIES = [
+  {key:"owner",    label:"家主"},
+  {key:"building", label:"建物"},
+  {key:"room",     label:"部屋"},
+  {key:"tenant",   label:"契約者"},
+  {key:"vendor",   label:"取引業者"},
+  {key:"contract", label:"契約"},
+];
+
+const CSV_ENTITY_FIELDS = {
+  owner:    ["name","kana","type","zip","address","tel","fax","email","bank","branch","accountType","accountNo","accountName","memo"],
+  building: ["name","kana","ownerId","zip","address","structure","floors","totalUnits","builtYear","builtMonth","parking","memo"],
+  room:     ["buildingId","roomNo","floor","layout","area","direction","status","rent","fee","deposit","keyMoney","facilities","memo"],
+  tenant:   ["name","kana","birthday","tel","email","occupation","roomId","contractStart","contractEnd","rent","guarantor","emergencyName","emergencyRelation","emergencyTel","memo"],
+  vendor:   ["name","kana","category","person","tel","fax","email","zip","address","memo"],
+  contract: ["contractNo","contractType","tenantName","tenantKana","roomId","contractDate","startDate","endDate","status","rent","fee","deposit","keyMoney","renewalFee","guarantor","guarantorContact","cosigner","cosignerTel","memo"],
+};
+
+function CsvImportSection({data, onBulkImport}) {
+  const [entity, setEntity]       = useState("owner");
+  const [step, setStep]           = useState(1);
+  const [headers, setHeaders]     = useState([]);
+  const [rows, setRows]           = useState([]);
+  const [mappings, setMappings]   = useState({});
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiError, setAiError]     = useState("");
+  const [previewData, setPreviewData] = useState([]);
+  const [importing, setImporting] = useState(false);
+  const [result, setResult]       = useState(null);
+
+  const fields = CSV_ENTITY_FIELDS[entity] || [];
+
+  const reset = () => {
+    setStep(1); setHeaders([]); setRows([]); setMappings({});
+    setPreviewData([]); setResult(null); setAiError("");
+  };
+
+  const handleEntityChange = (e) => { setEntity(e.target.value); reset(); };
+
+  const handleFile = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (typeof Papa === "undefined") { alert("PapaParse が読み込まれていません。ページを再読み込みしてください。"); return; }
+    Papa.parse(file, {
+      header: true,
+      skipEmptyLines: true,
+      complete: (res) => {
+        setHeaders(res.meta.fields || []);
+        setRows(res.data);
+        setMappings({});
+        setStep(2);
+        setResult(null);
+        setAiError("");
+      },
+      error: (err) => alert("CSVの読み込みに失敗しました: " + err.message),
+    });
+    e.target.value = "";
+  };
+
+  const runAiMapping = async () => {
+    const settings = data.settings;
+    if (!settings.aiEnabled || !settings.aiApiKey) {
+      setAiError("AI連携が設定されていません。上のAI連携設定を有効化してください。");
+      return;
+    }
+    setAiLoading(true);
+    setAiError("");
+    const entityLabel = CSV_IMPORT_ENTITIES.find(e => e.key === entity)?.label;
+    const sampleRows = rows.slice(0, 5);
+    const prompt = `以下のCSVヘッダとサンプルデータを見て、Zenkanの${entityLabel}エンティティのフィールドにマッピングしてください。
+
+Zenkanフィールド: ${fields.join(", ")}
+
+CSVヘッダ: ${JSON.stringify(headers)}
+
+サンプル行（先頭5行）:
+${JSON.stringify(sampleRows, null, 2)}
+
+各CSVヘッダをZenkanフィールドに対応付けてください。対応するフィールドがない場合はnullとしてください。
+以下のJSON形式のみで回答してください（説明文は不要）:
+{"mappings": [{"csv_column": "列名", "zenkan_field": "フィールド名またはnull", "confidence": "high/medium/low"}]}`;
+
+    try {
+      const res = await callClaudeApi(prompt, {...settings, aiMaxTokens: 1024});
+      const jsonMatch = res.text.match(/\{[\s\S]*"mappings"[\s\S]*\}/);
+      if (!jsonMatch) throw new Error("AIレスポンスのJSON解析に失敗しました");
+      const parsed = JSON.parse(jsonMatch[0]);
+      const newMappings = {};
+      (parsed.mappings || []).forEach(m => {
+        if (m.csv_column) newMappings[m.csv_column] = (m.zenkan_field && m.zenkan_field !== "null") ? m.zenkan_field : "";
+      });
+      setMappings(newMappings);
+    } catch(e) {
+      setAiError("AIマッピングエラー: " + e.message);
+    } finally {
+      setAiLoading(false);
+    }
+  };
+
+  const buildPreview = () => {
+    const cfg = ENTITIES[entity] || OPS[entity];
+    const idPrefix = cfg?.idPrefix || entity.slice(0, 3);
+    const converted = rows.map(() => {
+      // id is always generated fresh; do not re-use row values
+      return {id: newId(idPrefix)};
+    }).map((obj, i) => {
+      const row = rows[i];
+      Object.entries(mappings).forEach(([csvCol, zenkanField]) => {
+        if (zenkanField && row[csvCol] !== undefined && row[csvCol] !== "") {
+          obj[zenkanField] = row[csvCol];
+        }
+      });
+      return obj;
+    });
+    setPreviewData(converted);
+    setStep(3);
+  };
+
+  const runImport = () => {
+    setImporting(true);
+    const existing = data[entity] || [];
+    const cfg = ENTITIES[entity] || OPS[entity];
+    const pk = cfg?.primaryKey;
+    const existingPKs = pk ? new Set(existing.map(r => r[pk]).filter(Boolean)) : new Set();
+    let added = 0, skipped = 0, errors = 0;
+    const newItems = [];
+    previewData.forEach(item => {
+      try {
+        if (pk && item[pk] && existingPKs.has(item[pk])) { skipped++; return; }
+        newItems.push(item);
+        added++;
+      } catch(e) { errors++; }
+    });
+    onBulkImport(entity, newItems);
+    setResult({added, skipped, errors, total: previewData.length});
+    setStep(4);
+    setImporting(false);
+  };
+
+  const mappedFields = [...new Set(Object.values(mappings).filter(Boolean))];
+
+  return (
+    <div className="card">
+      <div className="card-head"><div className="card-head-title">📥 CSVインポート</div></div>
+      <div className="card-body">
+
+        {/* ── Step 1: entity + file ── */}
+        {step === 1 && (
+          <div>
+            <div className="banner info" style={{marginBottom:14, fontSize:12, lineHeight:1.6}}>
+              CSV形式のデータを一括インポートします。<strong>1行目はヘッダ行（列名）が必要</strong>です。AIがカラムを自動マッピングします。
+            </div>
+            <div className="form-grid">
+              <div className="form-field">
+                <label className="form-label">インポート先エンティティ</label>
+                <select className="form-select" value={entity} onChange={handleEntityChange}>
+                  {CSV_IMPORT_ENTITIES.map(e => <option key={e.key} value={e.key}>{e.label}</option>)}
+                </select>
+              </div>
+              <div className="form-field" style={{display:"flex", alignItems:"flex-end"}}>
+                <label className="btn" style={{cursor:"pointer"}}>
+                  📂 CSVファイルを選択
+                  <input type="file" accept=".csv,text/csv" style={{display:"none"}} onChange={handleFile} />
+                </label>
+              </div>
+            </div>
+            <div style={{marginTop:12, fontSize:12, color:"var(--muted)"}}>
+              対応フィールド: {fields.join(", ")}
+            </div>
+          </div>
+        )}
+
+        {/* ── Step 2: preview + mapping ── */}
+        {step === 2 && (
+          <div>
+            <div style={{display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:12}}>
+              <div style={{fontSize:13, fontWeight:600}}>CSVプレビュー（{rows.length}行）</div>
+              <button className="btn" onClick={reset}>← やり直し</button>
+            </div>
+
+            {/* Raw CSV preview table */}
+            <div style={{overflowX:"auto", marginBottom:20, borderRadius:8, border:"1px solid var(--border)"}}>
+              <table style={{width:"100%", fontSize:12, borderCollapse:"collapse", minWidth:400}}>
+                <thead>
+                  <tr>{headers.map(h => <th key={h} style={{padding:"6px 10px", background:"var(--surface-hover)", borderBottom:"1px solid var(--border)", whiteSpace:"nowrap", textAlign:"left"}}>{h}</th>)}</tr>
+                </thead>
+                <tbody>
+                  {rows.slice(0,5).map((row,i) => (
+                    <tr key={i} style={{background: i%2===0?"var(--surface)":"var(--bg)"}}>
+                      {headers.map(h => <td key={h} style={{padding:"4px 10px", borderBottom:"1px solid var(--border)", whiteSpace:"nowrap", maxWidth:160, overflow:"hidden", textOverflow:"ellipsis"}}>{row[h]??""}</td>)}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {/* AI mapping button */}
+            <div style={{display:"flex", alignItems:"center", gap:10, marginBottom:12}}>
+              <button className="btn btn-primary" onClick={runAiMapping} disabled={aiLoading}>
+                {aiLoading ? "⚡ AI解析中..." : "⚡ AIでカラムを自動マッピング"}
+              </button>
+              <span style={{fontSize:12, color:"var(--muted)"}}>またはドロップダウンで手動設定</span>
+            </div>
+            {aiError && <div className="login-error" style={{marginBottom:12}}>{aiError}</div>}
+
+            {/* Mapping grid */}
+            <div style={{marginBottom:20}}>
+              <div style={{fontSize:12, fontWeight:600, color:"var(--ink-2)", marginBottom:8}}>カラムマッピング</div>
+              <div style={{display:"grid", gridTemplateColumns:"1fr 20px 1fr", gap:"6px 8px", alignItems:"center"}}>
+                <div style={{fontSize:11, color:"var(--muted)", fontWeight:600, paddingBottom:2}}>CSVの列名</div>
+                <div></div>
+                <div style={{fontSize:11, color:"var(--muted)", fontWeight:600, paddingBottom:2}}>Zenkanフィールド</div>
+                {headers.map(h => (
+                  <React.Fragment key={h}>
+                    <div style={{fontSize:12, padding:"5px 8px", background:"var(--surface-hover)", borderRadius:6, border:"1px solid var(--border)", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap"}}>{h}</div>
+                    <div style={{textAlign:"center", color:"var(--muted)", fontSize:13}}>→</div>
+                    <select className="form-select" style={{fontSize:12}} value={mappings[h]||""} onChange={e => setMappings({...mappings, [h]: e.target.value})}>
+                      <option value="">（スキップ）</option>
+                      {fields.map(f => <option key={f} value={f}>{f}</option>)}
+                    </select>
+                  </React.Fragment>
+                ))}
+              </div>
+            </div>
+
+            <button className="btn btn-primary" onClick={buildPreview} disabled={!Object.values(mappings).some(Boolean)}>
+              プレビュー →
+            </button>
+          </div>
+        )}
+
+        {/* ── Step 3: converted data preview ── */}
+        {step === 3 && (
+          <div>
+            <div style={{display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:12}}>
+              <div style={{fontSize:13, fontWeight:600}}>変換後データ（{previewData.length}件）</div>
+              <button className="btn" onClick={() => setStep(2)}>← マッピング修正</button>
+            </div>
+            <div style={{overflowX:"auto", marginBottom:12, borderRadius:8, border:"1px solid var(--border)"}}>
+              <table style={{width:"100%", fontSize:12, borderCollapse:"collapse", minWidth:400}}>
+                <thead>
+                  <tr>
+                    {mappedFields.map(f => <th key={f} style={{padding:"6px 10px", background:"var(--surface-hover)", borderBottom:"1px solid var(--border)", whiteSpace:"nowrap", textAlign:"left"}}>{f}</th>)}
+                  </tr>
+                </thead>
+                <tbody>
+                  {previewData.slice(0,10).map((row,i) => (
+                    <tr key={i} style={{background: i%2===0?"var(--surface)":"var(--bg)"}}>
+                      {mappedFields.map(f => <td key={f} style={{padding:"4px 10px", borderBottom:"1px solid var(--border)", whiteSpace:"nowrap", maxWidth:160, overflow:"hidden", textOverflow:"ellipsis"}}>{row[f]??""}</td>)}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {previewData.length > 10 && <div style={{fontSize:12, color:"var(--muted)", marginBottom:12}}>先頭10件を表示 / 全{previewData.length}件がインポートされます</div>}
+            <button className="btn btn-primary" onClick={runImport} disabled={importing}>
+              {importing ? "インポート中..." : `✅ インポート実行（${previewData.length}件）`}
+            </button>
+          </div>
+        )}
+
+        {/* ── Step 4: result ── */}
+        {step === 4 && result && (
+          <div>
+            <div className="banner success" style={{marginBottom:16, fontSize:13}}>
+              ✅ インポート完了：<strong>{result.added}件追加</strong> / {result.skipped}件スキップ（重複） / {result.errors}件エラー
+            </div>
+            <button className="btn btn-primary" onClick={reset}>続けてインポート</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SettingsPage({data, onChange, onBulkImport}) {
   const [form, setForm] = useState(data.settings);
   const [saved, setSaved] = useState(false);
   const handleSave = () => {
@@ -5268,6 +5558,7 @@ function SettingsPage({data, onChange}) {
           </div>
         </div>
       </div>
+      <CsvImportSection data={data} onBulkImport={onBulkImport} />
     </>
   );
 }
