@@ -2473,28 +2473,9 @@ function App() {
     }
   }, [data]);
 
-  // ロード中・エラー画面
-  if(loadError) {
-    return (
-      <div style={{padding:40, fontFamily:"sans-serif"}}>
-        <h2 style={{color:"#9c3a30"}}>データ読込エラー</h2>
-        <p>{loadError}</p>
-        <p>ブラウザを再起動するか、別のブラウザでお試しください。</p>
-      </div>
-    );
-  }
-  if(!data) {
-    return (
-      <div style={{display:"flex", alignItems:"center", justifyContent:"center", minHeight:"100vh", fontFamily:"Noto Serif JP, serif"}}>
-        <div style={{textAlign:"center"}}>
-          <div style={{fontSize:40, color:"#9c3a30", marginBottom:12, letterSpacing:"0.3em"}}>賃</div>
-          <div style={{fontSize:14, color:"#8a8278"}}>データを読み込んでいます…</div>
-        </div>
-      </div>
-    );
-  }
-
+  // Rules of Hooks: 全 hook を早期リターンより前に配置
   const counts = useMemo(() => {
+    if(!data) return {};
     const c = {};
     [...ENTITY_ORDER, ...Object.keys(OPS), "billing", "remittance"].forEach(k => c[k] = (data[k]||[]).length);
     return c;
@@ -2640,6 +2621,27 @@ function App() {
   const handleSettingsChange = useCallback((next) => {
     setData(prev => addAudit({...prev, settings:next}, "update", "設定", "システム設定を更新"));
   }, []);
+
+  // ロード中・エラー画面（全 hook の後に置く — Rules of Hooks）
+  if(loadError) {
+    return (
+      <div style={{padding:40, fontFamily:"sans-serif"}}>
+        <h2 style={{color:"#9c3a30"}}>データ読込エラー</h2>
+        <p>{loadError}</p>
+        <p>ブラウザを再起動するか、別のブラウザでお試しください。</p>
+      </div>
+    );
+  }
+  if(!data) {
+    return (
+      <div style={{display:"flex", alignItems:"center", justifyContent:"center", minHeight:"100vh", fontFamily:"Noto Serif JP, serif"}}>
+        <div style={{textAlign:"center"}}>
+          <div style={{fontSize:40, color:"#9c3a30", marginBottom:12, letterSpacing:"0.3em"}}>賃</div>
+          <div style={{fontSize:14, color:"#8a8278"}}>データを読み込んでいます…</div>
+        </div>
+      </div>
+    );
+  }
 
   const seedSampleData = () => {
     if(!confirm("サンプルデータを投入します。よろしいですか？")) return;
