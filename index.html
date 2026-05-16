@@ -915,23 +915,22 @@ table.data tr.total-row td {
 }
 .login-card {
   width: 100%;
-  max-width: 380px;
+  max-width: 400px;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
+  border-radius: 16px;
   padding: 40px 36px;
-  box-shadow: var(--shadow-md);
+  box-shadow: var(--shadow-lg);
 }
 .login-logo {
   text-align: center;
   margin-bottom: 32px;
 }
-.login-logo .brand-mark {
-  font-size: 28px;
-  font-weight: 800;
-  color: var(--accent);
-  letter-spacing: -0.02em;
-  margin-bottom: 4px;
+.login-logo-inner {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
 }
 .login-title {
   font-size: 13px;
@@ -941,8 +940,9 @@ table.data tr.total-row td {
 .login-form .field { margin-bottom: 16px; }
 .login-error {
   background: var(--danger-soft);
+  border: 1px solid var(--danger-border);
   color: var(--danger);
-  border-radius: var(--radius);
+  border-radius: 8px;
   padding: 10px 12px;
   font-size: 13px;
   margin-bottom: 12px;
@@ -1010,23 +1010,27 @@ function LoginScreen() {
     <div className="login-wrap">
       <div className="login-card">
         <div className="login-logo">
-          <div className="brand-mark">Kanri</div>
+          <div className="login-logo-inner">
+            <div className="brand-mark">Kanri</div>
+          </div>
           <div className="login-title">賃貸管理システム</div>
         </div>
         <form onSubmit={handleSubmit} className="login-form">
           <div className="field">
-            <label className="field-label">メールアドレス</label>
-            <input className="field-input" type="email" value={email}
-              onChange={e => setEmail(e.target.value)} required autoFocus placeholder="you@example.com" />
+            <label className="form-label" style={{display:"block",marginBottom:6}}>メールアドレス</label>
+            <input className="form-input" type="email" value={email}
+              onChange={e => setEmail(e.target.value)} required autoFocus placeholder="you@example.com"
+              style={{width:"100%",boxSizing:"border-box"}} />
           </div>
           <div className="field">
-            <label className="field-label">パスワード</label>
-            <input className="field-input" type="password" value={password}
-              onChange={e => setPassword(e.target.value)} required placeholder="••••••••" />
+            <label className="form-label" style={{display:"block",marginBottom:6}}>パスワード</label>
+            <input className="form-input" type="password" value={password}
+              onChange={e => setPassword(e.target.value)} required placeholder="••••••••"
+              style={{width:"100%",boxSizing:"border-box"}} />
           </div>
           {error && <div className="login-error">{error}</div>}
           <button className="btn btn-primary" type="submit" disabled={loading}
-            style={{width:"100%", marginTop:8}}>
+            style={{width:"100%",marginTop:8}}>
             {loading ? "ログイン中..." : "ログイン"}
           </button>
         </form>
