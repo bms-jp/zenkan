@@ -1,7 +1,5 @@
 {
-  "name": "zenkan",
   "version": 2,
-  "buildCommand": null,
   "outputDirectory": ".",
   "cleanUrls": true,
   "trailingSlash": false
