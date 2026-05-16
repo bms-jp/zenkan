@@ -976,10 +976,7 @@ table.data tr.total-row td {
 <script>
 (function() {
   var SUPABASE_URL  = "https://oevvudsozznqforurezm.supabase.co";
-  var SUPABASE_ANON = "PASTE_ANON_KEY_HERE"; // ← supabase.com → Settings → API → anon public key
-  if (SUPABASE_ANON === "PASTE_ANON_KEY_HERE") {
-    console.warn("[Kanri] Supabase anon key not set. Login will not work until you set SUPABASE_ANON in index.html.");
-  }
+  var SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9ldnZ1ZHNvenpucWZvcnVyZXptIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg5MTg1MjksImV4cCI6MjA5NDQ5NDUyOX0.rwQMJDfb5XbRAB-i0PX8Z-HOxidcoCkDEWpSnkcWfts";
   window._supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON);
 })();
 </script>
