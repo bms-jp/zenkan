@@ -65,9 +65,9 @@ python -m http.server 8000
 - `callClaudeApi(prompt, settings)` 関数 (KanriApp.jsx 冒頭付近)
 - 設定で `aiAuthMode` を "direct"/"gateway" 切替可能
   - direct: x-api-key + anthropic-dangerous-direct-browser-access (今すぐ使える)
-  - gateway: Authorization Bearer (BMS API Gateway 経由、`http://localhost:8000/v1/ai/claude/messages` で稼働中)
-- エンドポイントURLとモデルは設定から動的変更。デフォルトモデル: `claude-sonnet-4-6`
-- BMS Gateway は **設定変更のみで切替** 可能 (コード変更不要)
+  - gateway: Authorization Bearer (将来 BMS API Gateway 接続用)
+- エンドポイントURLとモデルは設定から動的変更
+- BMS Gateway 完成時は **設定変更のみで切替** 可能 (コード変更不要)
 
 **学習フィードバックの仕組み**:
 - `data.aiAnalysis[]` に全分析記録を保存 (id, prompt, response, model, usage, rating, corrections, reviewerComment 等)

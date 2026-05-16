@@ -965,7 +965,7 @@ const DEFAULT_SETTINGS = {
   aiEnabled: false,
   aiEndpoint: "https://api.anthropic.com/v1/messages",
   aiApiKey: "",
-  aiModel: "claude-sonnet-4-6",
+  aiModel: "claude-sonnet-4-5",
   aiAuthMode: "direct", // "direct" = x-api-key (Anthropic直) / "gateway" = Authorization Bearer (BMS Gateway経由)
   aiMaxTokens: 4096,
 };
@@ -1628,7 +1628,7 @@ function buildProposalPrompt(data, year, month, ownerId) {
    ============================================================ */
 async function callClaudeApi(prompt, settings) {
   const endpoint = settings.aiEndpoint || "https://api.anthropic.com/v1/messages";
-  const model = settings.aiModel || "claude-sonnet-4-6";
+  const model = settings.aiModel || "claude-sonnet-4-5";
   const maxTokens = Number(settings.aiMaxTokens) || 4096;
   const apiKey = settings.aiApiKey || "";
   const authMode = settings.aiAuthMode || "direct";
@@ -5025,10 +5025,10 @@ function SettingsPage({data, onChange}) {
             </div>
             <div className="form-field">
               <label className="form-label">モデル</label>
-              <select className="form-select" value={form.aiModel||"claude-sonnet-4-6"} onChange={e => setForm({...form, aiModel: e.target.value})}>
-                <option value="claude-sonnet-4-6">claude-sonnet-4-6 (推奨・バランス型)</option>
-                <option value="claude-opus-4-7">claude-opus-4-7 (高品質・高コスト)</option>
-                <option value="claude-haiku-4-5-20251001">claude-haiku-4-5 (高速・低コスト)</option>
+              <select className="form-select" value={form.aiModel||"claude-sonnet-4-5"} onChange={e => setForm({...form, aiModel: e.target.value})}>
+                <option value="claude-sonnet-4-5">claude-sonnet-4-5 (推奨・バランス型)</option>
+                <option value="claude-opus-4-5">claude-opus-4-5 (高品質・高コスト)</option>
+                <option value="claude-haiku-4-5">claude-haiku-4-5 (高速・低コスト)</option>
               </select>
               <div className="form-help">分析の品質と速度・コストのトレードオフ</div>
             </div>
@@ -5049,10 +5049,10 @@ function SettingsPage({data, onChange}) {
         <div className="card-head"><div className="card-head-title">データ管理</div></div>
         <div className="card-body">
           <div className="banner info" style={{marginBottom:14}}>
-            データはブラウザの <strong>IndexedDB</strong>（kanri_v3 データベース）に保存されています。<strong>ブラウザのデータ削除・プライベートモード・ブラウザ変更で消失します</strong>。定期的にJSONバックアップを取得してください。
+            データはブラウザのlocalStorageに保存されています。<strong>ブラウザのデータ削除やプライベートモード切替で全消失します</strong>。定期的にJSONバックアップを取得してください。
           </div>
           <div className="kv-grid" style={{marginBottom:14}}>
-            <dt>現在使用量</dt><dd className="tabular">{(getStorageUsage(data)/1024).toFixed(1)} KB <span className="muted" style={{fontSize:11}}>（IndexedDB: 通常数百MB〜数GB使用可能）</span></dd>
+            <dt>現在使用量</dt><dd className="tabular">{(getStorageUsage(data)/1024).toFixed(1)} KB <span className="muted" style={{fontSize:11}}>（目安: 5〜10MB上限）</span></dd>
             <dt>登録件数（合計）</dt><dd className="tabular">{[...ENTITY_ORDER, ...OPS_ORDER, "billing", "payment", "remittance"].reduce((s,k) => s + ((data[k]||[]).length), 0)} 件</dd>
             <dt>操作ログ</dt><dd className="tabular">{(data.auditLog||[]).length} 件 <span className="muted" style={{fontSize:11}}>（1000件超は古い順に自動削除）</span></dd>
           </div>
