@@ -45,7 +45,7 @@ function filterWithLimit(items, predicate, maxHits = 500) {
 }
 
 /* ==========================================================================
-   賃貸管理システム ― ZENKAN V2
+   賃貸管理システム ― Kanri V2
    ========================================================================== */
 
 const LS_KEY = "kanri_v2_data";
@@ -429,6 +429,288 @@ const fmtYM = (y,m) => `${y}年${String(m).padStart(2,"0")}月`;
 const currentYM = () => { const d=new Date(); return {year:d.getFullYear(),month:d.getMonth()+1}; };
 
 /* ============================================================
+   オーナー向けキャッシュフロー提案書プロンプト生成
+   - 管理会社がオーナー (家主) に説明できるレベルの分析レポート
+   - 全保有物件のデータを集約し、10項目フレームワークで分析
+   ============================================================ */
+function buildProposalPrompt(data, year, month, ownerId) {
+  const fmtY = (n) => `¥${Number(n||0).toLocaleString("ja-JP")}`;
+  const owners = data.owner || [];
+  const buildings = data.building || [];
+  const rooms = data.room || [];
+  const contracts = data.contract || [];
+  const billings = data.billing || [];
+  const payments = data.payment || [];
+  const remittances = data.remittance || [];
+  const vendorPayments = data.vendorPayment || [];
+  const repairs = data.repair || [];
+  const tickets = data.ticket || [];
+  const applications = data.application || [];
+  const constructions = data.construction || [];
+  const settings = data.settings || {};
+
+  const owner = owners.find(o => o.id === ownerId);
+  if(!owner) return "エラー: 指定されたオーナーが見つかりません。";
+
+  // --- オーナー保有物件の集約 ---
+  const ownerBuildings = buildings.filter(b => b.ownerId === ownerId);
+  const ownerBldIds = ownerBuildings.map(b => b.id);
+  const ownerRooms = rooms.filter(r => ownerBldIds.includes(r.buildingId));
+  const totalRooms = ownerRooms.length;
+  const occupied = ownerRooms.filter(r => r.status === "入居中").length;
+  const vacant = ownerRooms.filter(r => r.status === "空室").length;
+  const listed = ownerRooms.filter(r => r.status === "募集中").length;
+  const occupancyRate = totalRooms > 0 ? ((occupied/totalRooms)*100).toFixed(1) : "0";
+
+  // 月次フィルタ
+  const ymStart = `${year}-${String(month).padStart(2,"0")}-01`;
+  const ymEnd   = `${year}-${String(month).padStart(2,"0")}-${String(new Date(year, month, 0).getDate()).padStart(2,"0")}`;
+  const prevMonth = month === 1 ? 12 : month - 1;
+  const prevYear  = month === 1 ? year - 1 : year;
+  const prevYmStart = `${prevYear}-${String(prevMonth).padStart(2,"0")}-01`;
+  const prevYmEnd   = `${prevYear}-${String(prevMonth).padStart(2,"0")}-${String(new Date(prevYear, prevMonth, 0).getDate()).padStart(2,"0")}`;
+
+  // 対象物件に紐づく契約
+  const ownerContracts = contracts.filter(c => ownerBldIds.includes(c.buildingId) || ownerRooms.some(r => r.id === c.roomId));
+  const activeContracts = ownerContracts.filter(c => c.status === "契約中");
+  const cancelPending = ownerContracts.filter(c => c.status === "解約予定");
+
+  // 3ヶ月以内の契約満了
+  const now = new Date();
+  const in3M = new Date(now.getFullYear(), now.getMonth()+3, now.getDate()).toISOString().slice(0,10);
+  const nowStr = now.toISOString().slice(0,10);
+  const endingSoon = activeContracts.filter(c => c.endDate && c.endDate >= nowStr && c.endDate <= in3M);
+
+  // 入金 (対象物件の請求に紐づく入金)
+  const ownerBillingIds = billings.filter(b => ownerContracts.some(c => c.id === b.contractId)).map(b => b.id);
+  const ownerPayments = payments.filter(p => ownerBillingIds.includes(p.billingId));
+  const thisMonthPayments = ownerPayments.filter(p => p.paidDate >= ymStart && p.paidDate <= ymEnd);
+  const prevMonthPayments = ownerPayments.filter(p => p.paidDate >= prevYmStart && p.paidDate <= prevYmEnd);
+  const thisMonthIncome = thisMonthPayments.reduce((s,p) => s + (Number(p.amount)||0), 0);
+  const prevMonthIncome = prevMonthPayments.reduce((s,p) => s + (Number(p.amount)||0), 0);
+
+  // 送金
+  const ownerRemits = remittances.filter(r => r.ownerId === ownerId && r.year === year && r.month === month);
+  const thisMonthRemit = ownerRemits.reduce((s,r) => s + (Number(r.netAmount)||0), 0);
+  const thisMonthFee = ownerRemits.reduce((s,r) => s + (Number(r.managementFee)||0), 0);
+  const thisMonthRepairDeduct = ownerRemits.reduce((s,r) => s + (Number(r.repairsDeducted)||0), 0);
+
+  // 修繕 (対象物件)
+  const ownerRepairs = repairs.filter(r => ownerBldIds.includes(r.buildingId));
+  const thisMonthRepairs = ownerRepairs.filter(r => r.completionDate >= ymStart && r.completionDate <= ymEnd);
+  const prevMonthRepairs = ownerRepairs.filter(r => r.completionDate >= prevYmStart && r.completionDate <= prevYmEnd);
+  const thisRepairCost = thisMonthRepairs.reduce((s,r) => s + (Number(r.cost)||0), 0);
+  const prevRepairCost = prevMonthRepairs.reduce((s,r) => s + (Number(r.cost)||0), 0);
+  const ownerBurdenRepairs = thisMonthRepairs.filter(r => r.paidBy === "家主負担");
+  const ownerBurdenCost = ownerBurdenRepairs.reduce((s,r) => s + (Number(r.cost)||0), 0);
+
+  // チケット・クレーム
+  const ownerTickets = tickets.filter(t => ownerBldIds.includes(t.buildingId) || ownerRooms.some(r => r.id === t.roomId));
+  const openTickets = ownerTickets.filter(t => t.status !== "完了");
+
+  // 申込 (対象物件の部屋)
+  const ownerApps = applications.filter(a => ownerRooms.some(r => r.id === a.roomId));
+  const activeApps = ownerApps.filter(a => ["申込中","審査中"].includes(a.status));
+
+  // 工事案件
+  const ownerConstructions = constructions.filter(c => ownerBldIds.includes(c.buildingId) || c.ownerId === ownerId);
+
+  // 滞納
+  const ownerBillings = billings.filter(b => ownerContracts.some(c => c.id === b.contractId));
+  const overdueBillings = ownerBillings.filter(b => b.status === "未収" || b.status === "一部入金");
+
+  // 月家賃合計
+  const monthlyRentTotal = ownerRooms.filter(r => r.status === "入居中").reduce((s,r) => s + (Number(r.rent)||0), 0);
+
+  // --- 12ヶ月推移データ (あれば) ---
+  const monthlyTrend = [];
+  for(let i = 11; i >= 0; i--) {
+    const d = new Date(year, month - 1 - i, 1);
+    const ty = d.getFullYear(), tm = d.getMonth() + 1;
+    const ms = `${ty}-${String(tm).padStart(2,"0")}-01`;
+    const me = `${ty}-${String(tm).padStart(2,"0")}-${String(new Date(ty, tm, 0).getDate()).padStart(2,"0")}`;
+    const inc = ownerPayments.filter(p => p.paidDate >= ms && p.paidDate <= me).reduce((s,p) => s + (Number(p.amount)||0), 0);
+    const rep = ownerRepairs.filter(r => r.completionDate >= ms && r.completionDate <= me).reduce((s,r) => s + (Number(r.cost)||0), 0);
+    monthlyTrend.push({year:ty, month:tm, income:inc, repairCost:rep});
+  }
+
+  // --- プロンプト構築 ---
+  const L = [];
+  L.push(`あなたは不動産管理・不動産経営に特化した高度なキャッシュフロー分析AIです。`);
+  L.push(`以下のデータを統合分析し、不動産オーナー向けの提案書を作成してください。`);
+  L.push(`「過去の会計結果の説明」ではなく「未来のキャッシュフロー悪化・改善シグナルの検知」を行ってください。`);
+  L.push(``);
+
+  // 学習コンテキスト
+  const learningCtx = buildLearningContext(data.aiAnalysis || []);
+  if(learningCtx) { L.push(learningCtx); L.push(``); }
+
+  L.push(`# オーナー情報`);
+  L.push(`- 氏名: ${owner.name}`);
+  L.push(`- 区分: ${owner.type || "個人"}`);
+  L.push(`- 保有建物: ${ownerBuildings.length}棟`);
+  L.push(`- 保有部屋: ${totalRooms}室 (入居中 ${occupied} / 空室 ${vacant} / 募集中 ${listed})`);
+  L.push(`- 入居率: ${occupancyRate}%`);
+  L.push(`- 月額家賃合計 (満室想定): ${fmtY(monthlyRentTotal + ownerRooms.filter(r => r.status !== "入居中").reduce((s,r)=>s+(Number(r.rent)||0),0))}`);
+  L.push(`- 月額家賃合計 (現実): ${fmtY(monthlyRentTotal)}`);
+  L.push(`- 管理手数料率: ${settings.managementFeeRate || 5}%`);
+  L.push(``);
+
+  L.push(`# 保有物件一覧`);
+  ownerBuildings.forEach(b => {
+    const bRooms = ownerRooms.filter(r => r.buildingId === b.id);
+    const bOcc = bRooms.filter(r => r.status === "入居中").length;
+    const bTotal = bRooms.length;
+    const bRate = bTotal > 0 ? ((bOcc/bTotal)*100).toFixed(0) : 0;
+    L.push(`- ${b.name}: ${bTotal}室 (入居${bOcc} 空室${bTotal-bOcc}) 入居率${bRate}% ${b.structure||""} ${b.builtYear ? "築"+b.builtYear+"年" : ""}`);
+  });
+  L.push(``);
+
+  L.push(`# 対象月: ${year}年${month}月`);
+  L.push(``);
+
+  L.push(`## 入出金データ`);
+  L.push(`- 今月の家賃入金: ${fmtY(thisMonthIncome)} (前月 ${fmtY(prevMonthIncome)})`);
+  L.push(`- 今月の送金額: ${fmtY(thisMonthRemit)}`);
+  L.push(`- 管理手数料: ${fmtY(thisMonthFee)}`);
+  L.push(`- 修繕費控除: ${fmtY(thisMonthRepairDeduct)}`);
+  L.push(`- オーナー手取り概算: ${fmtY(thisMonthIncome - thisMonthFee - ownerBurdenCost)}`);
+  L.push(``);
+
+  if(overdueBillings.length > 0) {
+    L.push(`## 滞納状況 ⚠`);
+    L.push(`- 未収・一部入金: ${overdueBillings.length}件`);
+    overdueBillings.slice(0,5).forEach(b => {
+      const contract = contracts.find(c => c.id === b.contractId);
+      L.push(`  - ${contract?.tenantName || "不明"}: ${fmtY(b.totalAmount)} (請求日 ${b.billingDate || "不明"})`);
+    });
+    L.push(``);
+  }
+
+  L.push(`## 修繕履歴 (当月)`);
+  if(thisMonthRepairs.length === 0) { L.push(`- 当月修繕なし`); }
+  else {
+    thisMonthRepairs.forEach(r => {
+      const bld = buildings.find(b => b.id === r.buildingId)?.name || "不明";
+      L.push(`- ${bld}: ${r.workContent||"-"} ${fmtY(r.cost)} (${r.paidBy||"負担不明"})`);
+    });
+    L.push(`- 当月修繕費合計: ${fmtY(thisRepairCost)} (前月 ${fmtY(prevRepairCost)})`);
+    L.push(`- うちオーナー負担: ${fmtY(ownerBurdenCost)}`);
+  }
+  L.push(``);
+
+  if(openTickets.length > 0) {
+    L.push(`## クレーム・問い合わせ (未完了)`);
+    openTickets.slice(0,5).forEach(t => {
+      L.push(`- [${t.priority||"中"}] ${t.content||"内容不明"} (${t.status}) — ${t.category||""}`);
+    });
+    L.push(``);
+  }
+
+  if(endingSoon.length > 0) {
+    L.push(`## 3ヶ月以内の契約満了予定`);
+    endingSoon.forEach(c => {
+      L.push(`- ${c.tenantName||"不明"}: 契約終了 ${c.endDate} (部屋 ${c.roomNo||""})`);
+    });
+    L.push(``);
+  }
+
+  if(cancelPending.length > 0) {
+    L.push(`## 解約予定`);
+    cancelPending.forEach(c => {
+      L.push(`- ${c.tenantName||"不明"}: ${c.moveOutDate || c.endDate || "日程未定"}`);
+    });
+    L.push(``);
+  }
+
+  if(activeApps.length > 0) {
+    L.push(`## 入居申込 (進行中)`);
+    activeApps.forEach(a => {
+      L.push(`- ${a.applicantName||"不明"}: ${a.status} (${a.roomNo||""})`);
+    });
+    L.push(``);
+  }
+
+  if(ownerConstructions.length > 0) {
+    L.push(`## 工事案件`);
+    ownerConstructions.forEach(c => {
+      L.push(`- [${c.status}] ${c.name}: 受注 ${fmtY(c.contractAmount)} / 入金済 ${fmtY(c.paidAmount)}`);
+    });
+    L.push(``);
+  }
+
+  L.push(`## 12ヶ月推移`);
+  monthlyTrend.forEach(m => {
+    L.push(`- ${m.year}年${m.month}月: 入金 ${fmtY(m.income)} / 修繕費 ${fmtY(m.repairCost)}`);
+  });
+  L.push(``);
+
+  // クロスエンティティ統計 (全社データも参考として)
+  L.push(`## 全社参考データ (この物件と他物件の比較用)`);
+  L.push(buildCrossEntityStats(data));
+  L.push(``);
+
+  // 分析指示 (ユーザーのフレームワーク)
+  L.push(`# 分析指示`);
+  L.push(``);
+  L.push(`以下の10項目で提案書を作成してください。Markdown形式で構造化してください。`);
+  L.push(`これは管理会社がオーナー (${owner.name} 様) に提出するドキュメントです。`);
+  L.push(`専門用語を避け、具体的な金額と物件名で語ってください。`);
+  L.push(``);
+  L.push(`## 1. 全体サマリー`);
+  L.push(`- ${owner.name}様の保有資産全体の健全度を3行で評価`);
+  L.push(`- 前月比の収支変動を具体的金額で提示`);
+  L.push(``);
+  L.push(`## 2. 重要異常検知`);
+  L.push(`- 通常状態と比較した異常値 (滞納増加・空室悪化・修繕急増・回収率悪化)`);
+  L.push(`- 「現在は問題化していないが将来重大問題になりうる兆候」も抽出`);
+  L.push(``);
+  L.push(`## 3. キャッシュフロー増減の原因分析`);
+  L.push(`- 収入増加/減少要因、支出増加要因、支出削減余地`);
+  L.push(`- 「なぜ起きたか」まで因果関係を推定`);
+  L.push(`- 原因を分類: 市場要因 / 物件要因 / 人的要因 / 経営戦略要因`);
+  L.push(`- さらに: コントロール可能 / 半コントロール可能 / 外部要因 に分類`);
+  L.push(``);
+  L.push(`## 4. 先行指標分析`);
+  L.push(`- 先行指標 (空室率推移・申込数・解約予定) vs 結果指標 (入金額・利益) vs 遅行指標 (修繕費累計)`);
+  L.push(`- 「将来的なCF悪化の予兆」を重要視`);
+  L.push(``);
+  L.push(`## 5. 将来キャッシュフロー予測`);
+  L.push(`- 3ヶ月後・6ヶ月後・12ヶ月後のキャッシュフロー・空室率・修繕費を予測`);
+  L.push(`- 予測の根拠となる指標も提示`);
+  L.push(``);
+  L.push(`## 6. リスク優先順位`);
+  L.push(`- 影響度 × 緊急度 × 発生確率 でスコアリング`);
+  L.push(`- 最優先対応 / 早期対応推奨 / 監視対象 / 許容可能 に分類`);
+  L.push(``);
+  L.push(`## 7. 改善提案`);
+  L.push(`- 短期 (1ヶ月以内) / 中期 (3-6ヶ月) / 長期 (6-12ヶ月) で分類`);
+  L.push(`- 各提案に: 即効性・利益インパクト・導入難易度・実施コスト見込み を併記`);
+  L.push(``);
+  L.push(`## 8. 設備・修繕の予防保全提案`);
+  L.push(`- 修繕履歴から見える傾向 (同じ設備の故障パターン、築年数による劣化予測)`);
+  L.push(`- 「壊れてから直す」→「壊れる前に対策する」への移行提案`);
+  L.push(`- 予防保全による年間コスト削減見込み`);
+  L.push(``);
+  L.push(`## 9. 経営インパクト (オーナー目線)`);
+  L.push(`- 提案を全て実施した場合の年間収益改善額`);
+  L.push(`- 何もしなかった場合の12ヶ月後の想定損失`);
+  L.push(`- 投資対効果 (ROI) の明示`);
+  L.push(``);
+  L.push(`## 10. 今すぐ対応すべき項目 (アクションリスト)`);
+  L.push(`- 優先度順に3-5件、具体的なアクション・担当・期限を明記`);
+  L.push(`- オーナーの承認が必要な項目と、管理会社で実行可能な項目を区別`);
+  L.push(``);
+  L.push(`---`);
+  L.push(`レポート末尾に以下を付記してください:`);
+  L.push(`- 作成日: ${year}年${month}月`);
+  L.push(`- 作成者: ${settings.companyName || "管理会社"}`);
+  L.push(`- 対象: ${owner.name} 様`);
+  L.push(`- 「本レポートは管理データに基づくAI分析です。最終判断はオーナー様と管理会社で協議のうえ行ってください。」`);
+  return L.join("\n");
+}
+
+/* ============================================================
    Claude API クライアント
    - "direct" mode: Anthropic API 直接 (x-api-key + dangerous-direct-browser-access)
    - "gateway" mode: BMS API Gateway 経由 (Authorization: Bearer)
@@ -666,6 +948,153 @@ function buildCrossEntityStats(data) {
     constructions.forEach(c => { catC[c.category||"その他"] = (catC[c.category||"その他"]||0)+1; });
     const catTop = Object.entries(catC).sort((a,b)=>b[1]-a[1]);
     if(catTop.length > 0) L.push(`- 区分別: ${catTop.map(c => `${c[0]} ${c[1]}件`).join(" / ")}`);
+  }
+
+  // ====== 先行指標シグナル検知 (CF悪化の予兆) ======
+  L.push(``);
+  L.push(`### ⚠ 先行指標シグナル検知`);
+  L.push(`以下はキャッシュフロー悪化の「予兆」を検出する先行指標です。結果指標（空室増加・滞納増加等）ではなく、その前段階のシグナルに注目してください。`);
+  L.push(``);
+
+  const now = new Date();
+  const nowStr = now.toISOString().slice(0,10);
+  let repeatRepairs = []; // スコープを先行指標全体に広げる (総合判定で使用)
+
+  // --- 空室リスクシグナル ---
+  L.push(`#### 空室リスクシグナル`);
+  if(rooms.length > 0) {
+    const vacantCount = rooms.filter(r => r.status === "空室" || r.status === "募集中").length;
+    const vacancyRate = ((vacantCount / rooms.length) * 100).toFixed(1);
+    L.push(`- 現在の空室率: ${vacancyRate}% (${vacantCount}/${rooms.length}室)`);
+  }
+  // 3ヶ月以内の契約満了
+  const in3m = new Date(now.getFullYear(), now.getMonth() + 3, now.getDate()).toISOString().slice(0,10);
+  const expiringContracts = contracts.filter(c => c.status === "契約中" && c.endDate && c.endDate >= nowStr && c.endDate <= in3m);
+  if(expiringContracts.length > 0) {
+    L.push(`- ⚠ 3ヶ月以内に契約満了: ${expiringContracts.length}件 (全契約の${contracts.filter(c=>c.status==="契約中").length > 0 ? ((expiringContracts.length/contracts.filter(c=>c.status==="契約中").length)*100).toFixed(1) : 0}%)`);
+    // 更新交渉の状況は把握可能か
+  }
+  // 解約予定の集中
+  const cancelPending = contracts.filter(c => c.status === "解約予定");
+  if(cancelPending.length > 0) {
+    L.push(`- ⚠ 解約予定: ${cancelPending.length}件`);
+  }
+  // 申込パイプライン (空室回復の見込み)
+  const activeApps = applications.filter(a => ["申込中","審査中"].includes(a.status));
+  if(activeApps.length > 0) {
+    L.push(`- 申込パイプライン (空室回復の先行指標): 申込中 ${applications.filter(a=>a.status==="申込中").length}件 / 審査中 ${applications.filter(a=>a.status==="審査中").length}件`);
+  } else if(rooms.filter(r => r.status === "空室" || r.status === "募集中").length > 0) {
+    L.push(`- ⚠ 空室あるが申込パイプラインが空。リーシング活動の強化が必要か検証`);
+  }
+
+  // --- 滞納リスクシグナル ---
+  L.push(``);
+  L.push(`#### 滞納リスクシグナル`);
+  const overdueBillings = billings.filter(b => b.status === "未収" || b.status === "一部入金");
+  const totalBillings = billings.length;
+  if(totalBillings > 0) {
+    const overdueRate = ((overdueBillings.length / totalBillings) * 100).toFixed(2);
+    L.push(`- 未収率: ${overdueRate}% (${overdueBillings.length}/${totalBillings}件)`);
+    if(overdueBillings.length > 0) {
+      const overdueTotal = overdueBillings.reduce((s,b) => s + (Number(b.totalAmount)||0) - (Number(b.paidAmount)||0), 0);
+      L.push(`- 未収金残高: ${fmtY(overdueTotal)}`);
+    }
+  }
+
+  // --- 修繕リスクシグナル ---
+  L.push(``);
+  L.push(`#### 修繕リスクシグナル`);
+  if(repairs.length > 0) {
+    // 修繕費の3ヶ月推移 (加速/安定/減速を判定)
+    const months3 = [];
+    for(let i = 2; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const mStart = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-01`;
+      const mEnd = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(new Date(d.getFullYear(), d.getMonth()+1, 0).getDate()).padStart(2,"0")}`;
+      const mRepairs = repairs.filter(r => r.completionDate >= mStart && r.completionDate <= mEnd);
+      const mCost = mRepairs.reduce((s,r) => s + (Number(r.cost)||0), 0);
+      months3.push({label:`${d.getMonth()+1}月`, cost:mCost, count:mRepairs.length});
+    }
+    L.push(`- 修繕費3ヶ月推移: ${months3.map(m => `${m.label} ${fmtY(m.cost)} (${m.count}件)`).join(" → ")}`);
+    const trend = months3[2].cost > months3[1].cost && months3[1].cost > months3[0].cost ? "加速中 ⚠" :
+                  months3[2].cost < months3[1].cost && months3[1].cost < months3[0].cost ? "減速中" : "横ばい";
+    L.push(`- トレンド: ${trend}`);
+
+    // 繰返修繕 (同一建物×同一内容 が1年以内に2回以上)
+    const oneYearAgo = new Date(now.getFullYear()-1, now.getMonth(), now.getDate()).toISOString().slice(0,10);
+    const recentRepairs = repairs.filter(r => r.completionDate >= oneYearAgo);
+    const repairsByKey = {};
+    recentRepairs.forEach(r => {
+      const key = `${r.buildingId||"?"}__${(r.workContent||"").replace(/\s+/g,"")}`;
+      repairsByKey[key] = (repairsByKey[key] || 0) + 1;
+    });
+    repeatRepairs = Object.entries(repairsByKey).filter(([_, count]) => count >= 2);
+    if(repeatRepairs.length > 0) {
+      L.push(`- ⚠ 繰返修繕 (1年以内に同一箇所2回以上): ${repeatRepairs.length}件 — 設備交換を検討すべき兆候`);
+      repeatRepairs.slice(0,3).forEach(([key, count]) => {
+        const [bldId, content] = key.split("__");
+        const bldName = buildings.find(b => b.id === bldId)?.name || "不明";
+        L.push(`  - ${bldName} / ${content || "内容不明"}: ${count}回`);
+      });
+    }
+  }
+
+  // --- チケット中の設備不具合率 (修繕費急増の先行指標) ---
+  if(tickets.length > 0) {
+    const equipTickets = tickets.filter(t => t.category === "設備不具合" || t.category === "設備故障");
+    const eqRate = ((equipTickets.length / tickets.length) * 100).toFixed(1);
+    L.push(`- チケット中の設備不具合率: ${eqRate}% (${equipTickets.length}/${tickets.length}件)`);
+    if(Number(eqRate) >= 40) L.push(`  → ⚠ 40%超。設備老朽化の兆候。予防保全計画の策定を推奨`);
+
+    // チケット平均対応日数
+    const resolvedTickets = tickets.filter(t => t.status === "完了" && t.createdAt && t.resolvedAt);
+    if(resolvedTickets.length > 0) {
+      const avgDays = resolvedTickets.reduce((s,t) => {
+        const created = new Date(t.createdAt);
+        const resolved = new Date(t.resolvedAt);
+        return s + (resolved - created) / (1000*60*60*24);
+      }, 0) / resolvedTickets.length;
+      L.push(`- チケット平均対応日数: ${avgDays.toFixed(1)}日`);
+      if(avgDays > 7) L.push(`  → ⚠ 7日超。対応遅延がクレーム悪化→退去に繋がるリスク`);
+    }
+    // 未完了チケットの滞留
+    const openTickets = tickets.filter(t => t.status !== "完了");
+    if(openTickets.length > 0) {
+      L.push(`- 未完了チケット: ${openTickets.length}件`);
+    }
+  }
+
+  // --- 業者リスク ---
+  if(vendorPayments.filter(v => v.status === "支払済").length >= 3) {
+    L.push(``);
+    L.push(`#### 業者リスクシグナル`);
+    const paidVPs = vendorPayments.filter(v => v.status === "支払済");
+    const totalByV = {};
+    paidVPs.forEach(v => { totalByV[v.vendorId] = (totalByV[v.vendorId]||0) + (Number(v.amount)||0); });
+    const sortedV = Object.entries(totalByV).sort((a,b)=>b[1]-a[1]);
+    const totalAll = Object.values(totalByV).reduce((s,v)=>s+v,0);
+    if(sortedV.length >= 2 && totalAll > 0) {
+      const top2Amt = sortedV.slice(0,2).reduce((s,[_,amt])=>s+amt,0);
+      const concentration = ((top2Amt/totalAll)*100).toFixed(1);
+      L.push(`- 業者集中度 (上位2社): ${concentration}%`);
+      if(Number(concentration) >= 70) L.push(`  → ⚠ 70%超。価格交渉力低下・倒産リスク。分散を検討`);
+    }
+  }
+
+  // --- 総合リスク判定 ---
+  L.push(``);
+  L.push(`#### 総合シグナル判定`);
+  const signals = [];
+  if(expiringContracts.length >= 3) signals.push("契約満了集中");
+  if(cancelPending.length >= 2) signals.push("解約予定複数");
+  if(overdueBillings.length >= 3) signals.push("滞納件数増加");
+  if(repeatRepairs.length >= 2) signals.push("繰返修繕");
+  if(rooms.length > 0 && rooms.filter(r => r.status === "空室" || r.status === "募集中").length / rooms.length > 0.1) signals.push("空室率10%超");
+  if(signals.length === 0) {
+    L.push(`- 現時点で重大な先行シグナルは検出されていません`);
+  } else {
+    L.push(`- 🔴 検出されたシグナル (${signals.length}件): ${signals.join(" / ")}`);
+    L.push(`- これらのシグナルが複合すると、3ヶ月以内にキャッシュフロー悪化が顕在化する可能性があります`);
   }
 
   return L.join("\n");
@@ -994,7 +1423,6 @@ const OPS = {
 };
 
 const ENTITY_ORDER = ["owner","building","room","tenant","vendor"];
-const OPS_ORDER = Object.keys(OPS);
 
 const refLabel = (data, entityKey, id) => {
   if(!id) return "—";
@@ -1135,26 +1563,28 @@ function App() {
     }
   }, [data]);
 
-  // 解約予定の自動実行: 解約日が到来した契約を自動的に解約済にする
-  useEffect(() => {
-    if(!data) return;
-    const today = todayLocal();
-    const due = (data.contract||[]).filter(c => c.status === "解約予定" && c.terminationDate && c.terminationDate <= today);
-    if(due.length === 0) return;
-    setData(prev => {
-      let next = {...prev, contract:[...prev.contract], room:[...prev.room]};
-      due.forEach(c => {
-        next.contract = next.contract.map(x => x.id === c.id ? {...x, status:"解約済"} : x);
-        if(c.roomId) next.room = next.room.map(r => r.id === c.roomId ? {...r, status:"空室"} : r);
-        next = addAudit(next, "auto_terminate", "契約", `契約「${c.contractNo}」を自動解約（予定日: ${c.terminationDate}）`);
-      });
-      return next;
-    });
-  }, [data?.contract?.length]);
+  // ロード中・エラー画面
+  if(loadError) {
+    return (
+      <div style={{padding:40, fontFamily:"sans-serif"}}>
+        <h2 style={{color:"#9c3a30"}}>データ読込エラー</h2>
+        <p>{loadError}</p>
+        <p>ブラウザを再起動するか、別のブラウザでお試しください。</p>
+      </div>
+    );
+  }
+  if(!data) {
+    return (
+      <div style={{display:"flex", alignItems:"center", justifyContent:"center", minHeight:"100vh", fontFamily:"Noto Serif JP, serif"}}>
+        <div style={{textAlign:"center"}}>
+          <div style={{fontSize:40, color:"#9c3a30", marginBottom:12, letterSpacing:"0.3em"}}>賃</div>
+          <div style={{fontSize:14, color:"#8a8278"}}>データを読み込んでいます…</div>
+        </div>
+      </div>
+    );
+  }
 
-  // Rules of Hooks: 全 hook を早期リターンより前に配置
   const counts = useMemo(() => {
-    if(!data) return {};
     const c = {};
     [...ENTITY_ORDER, ...Object.keys(OPS), "billing", "remittance"].forEach(k => c[k] = (data[k]||[]).length);
     return c;
@@ -1220,17 +1650,9 @@ function App() {
     setData(prev => {
       const orig = prev.contract.find(c => c.id === contractId);
       if(!orig) return prev;
-      const today = todayLocal();
-      if(termData.terminationDate <= today) {
-        // 解約日が今日以前 → 即時解約
-        const updated = prev.contract.map(c => c.id === contractId ? {...c, status:"解約済", ...termData} : c);
-        const updatedRooms = prev.room.map(r => r.id === orig.roomId ? {...r, status:"空室"} : r);
-        return addAudit({...prev, contract:updated, room:updatedRooms}, "terminate", "契約", `契約「${orig.contractNo}」を解約（${termData.terminationDate}）`);
-      } else {
-        // 解約日が未来 → 解約予定にする
-        const updated = prev.contract.map(c => c.id === contractId ? {...c, status:"解約予定", ...termData} : c);
-        return addAudit({...prev, contract:updated}, "schedule_terminate", "契約", `契約「${orig.contractNo}」を解約予定（${termData.terminationDate}）`);
-      }
+      const updated = prev.contract.map(c => c.id === contractId ? {...c, status:"解約済", ...termData} : c);
+      const updatedRooms = prev.room.map(r => r.id === orig.roomId ? {...r, status:"空室"} : r);
+      return addAudit({...prev, contract:updated, room:updatedRooms}, "terminate", "契約", `契約「${orig.contractNo}」を解約（${termData.terminationDate}）`);
     });
     setWorkflow(null);
   }, []);
@@ -1309,27 +1731,6 @@ function App() {
     setData(prev => addAudit({...prev, settings:next}, "update", "設定", "システム設定を更新"));
   }, []);
 
-  // ロード中・エラー画面（全 hook の後に置く — Rules of Hooks）
-  if(loadError) {
-    return (
-      <div style={{padding:40, fontFamily:"sans-serif"}}>
-        <h2 style={{color:"#9c3a30"}}>データ読込エラー</h2>
-        <p>{loadError}</p>
-        <p>ブラウザを再起動するか、別のブラウザでお試しください。</p>
-      </div>
-    );
-  }
-  if(!data) {
-    return (
-      <div style={{display:"flex", alignItems:"center", justifyContent:"center", minHeight:"100vh", fontFamily:"Noto Serif JP, serif"}}>
-        <div style={{textAlign:"center"}}>
-          <div style={{fontSize:40, color:"#9c3a30", marginBottom:12, letterSpacing:"0.3em"}}>賃</div>
-          <div style={{fontSize:14, color:"#8a8278"}}>データを読み込んでいます…</div>
-        </div>
-      </div>
-    );
-  }
-
   const seedSampleData = () => {
     if(!confirm("サンプルデータを投入します。よろしいですか？")) return;
     const own1 = {id:newId("own"), name:"田中 太郎", kana:"タナカ タロウ", type:"個人", address:"大阪府大阪市北区梅田1-1-1", tel:"06-1234-5678", bank:"三井住友銀行", branch:"梅田支店", accountType:"普通", accountNo:"1234567"};
@@ -1401,7 +1802,7 @@ function App() {
           </div>
         )}
         {renderView()}
-        <div className="footer-credit">ZENKAN · V3 · IndexedDB</div>
+        <div className="footer-credit">Kanri System · V3 · IndexedDB</div>
       </main>
 
       {/* 保存状態インジケータ (右下) */}
@@ -1428,7 +1829,7 @@ function Sidebar({view, setView, counts, data}) {
   return (
     <aside className="sidebar">
       <div className="brand">
-        <div className="brand-mark">ZENKAN</div>
+        <div className="brand-mark">Kanri System</div>
         <div className="brand-title">賃貸管理</div>
         <div className="brand-subtitle">RENTAL ADMIN · V2</div>
       </div>
@@ -1797,7 +2198,7 @@ function ContractPage({data, setEditing, setConfirmDelete, setWorkflow}) {
                 <td className="col-actions">
                   {c.status === "契約中" && (<>
                     <button className="btn btn-sm btn-success" onClick={() => setWorkflow({kind:"renew", payload:c})}>更新</button>
-                    <button className="btn btn-sm" onClick={() => setWorkflow({kind:"terminate", payload:c})}>解約予定</button>
+                    <button className="btn btn-sm" onClick={() => setWorkflow({kind:"terminate", payload:c})}>解約</button>
                   </>)}
                   <button className="btn btn-sm btn-ghost" onClick={() => setEditing({entity:"contract", item:c})}>編集</button>
                   <button className="btn btn-sm btn-ghost btn-danger" onClick={() => setConfirmDelete({entity:"contract", id:c.id, label:c.contractNo})}>削除</button>
@@ -2074,7 +2475,7 @@ function AnalyticsPage({data}) {
   const repairByCategory = useMemo(() => {
     const map = {};
     for(const r of data.repair||[]) {
-      const v = (data.vendor||[]).find(x => x.id === r.vendorId);
+      const v = data.vendor.find(x => x.id === r.vendorId);
       const cat = v ? v.category : "未設定";
       map[cat] = (map[cat] || 0) + (Number(r.cost)||0);
     }
@@ -2228,7 +2629,7 @@ function AccountingExportPage({data}) {
     // 入金 (賃料収入)
     for(const p of data.payment||[]) {
       if(p.paidDate >= from && p.paidDate <= to) {
-        const billing = (data.billing||[]).find(b => b.id === p.billingId);
+        const billing = data.billing.find(b => b.id === p.billingId);
         const contractRef = billing ? refLabel(data,"contract",billing.contractId) : "";
         out.push({
           date: p.paidDate, debit:"現金預金", credit:"売上高（賃料収入）",
@@ -2240,7 +2641,7 @@ function AccountingExportPage({data}) {
     for(const v of data.vendorPayment||[]) {
       if(v.status !== "支払済" || !v.paidDate) continue;
       if(v.paidDate >= from && v.paidDate <= to) {
-        const cat = ((data.vendor||[]).find(x => x.id === v.vendorId) || {}).category || "";
+        const cat = (data.vendor.find(x => x.id === v.vendorId) || {}).category || "";
         const account = cat === "清掃" ? "清掃費" : (cat === "修繕" || cat.includes("工事")) ? "修繕費" : "外注費";
         out.push({
           date: v.paidDate, debit:account, credit:"現金預金",
@@ -2688,6 +3089,60 @@ function CashflowPage({data, onSaveAnalysis}) {
   const [aiError, setAiError] = useState(null);
   const [currentResult, setCurrentResult] = useState(null);
   const [showPromptModal, setShowPromptModal] = useState(false);
+
+  // ---- 提案書生成状態 ----
+  const [proposalOwnerId, setProposalOwnerId] = useState("");
+  const [proposalState, setProposalState] = useState("idle");
+  const [proposalError, setProposalError] = useState(null);
+  const [proposalResult, setProposalResult] = useState(null);
+
+  // ---- 提案書API実行 ----
+  const runProposal = async () => {
+    const settings = data.settings || {};
+    if(!settings.aiEnabled || !settings.aiApiKey) {
+      setProposalState("error");
+      setProposalError("AI連携が未設定です。設定ページで AI連携を有効化してください。");
+      return;
+    }
+    if(!proposalOwnerId) {
+      setProposalState("error");
+      setProposalError("オーナーを選択してください。");
+      return;
+    }
+    setProposalState("running");
+    setProposalError(null);
+    try {
+      const prompt = buildProposalPrompt(data, year, month, proposalOwnerId);
+      const startTime = Date.now();
+      const result = await callClaudeApi(prompt, {...settings, aiMaxTokens: Math.max(Number(settings.aiMaxTokens)||4096, 6000)});
+      const elapsedMs = Date.now() - startTime;
+      const item = {
+        id: `ai_proposal_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
+        type: "owner_proposal",
+        periodYear: year,
+        periodMonth: month,
+        ownerId: proposalOwnerId,
+        createdAt: new Date().toISOString(),
+        model: result.model,
+        prompt,
+        response: result.text,
+        usage: result.usage,
+        elapsedMs,
+        reviewStatus: "pending",
+        rating: null,
+        reviewerComment: "",
+        corrections: "",
+        reviewedAt: null,
+      };
+      if(onSaveAnalysis) onSaveAnalysis(item);
+      setProposalResult(item);
+      setProposalState("success");
+    } catch(e) {
+      console.error("[提案書] 失敗:", e);
+      setProposalError(e.message || String(e));
+      setProposalState("error");
+    }
+  };
 
   // ---- API実行 ----
   const runAiAnalysis = async () => {
@@ -3175,6 +3630,125 @@ function CashflowPage({data, onSaveAnalysis}) {
       {/* 工事案件の月次キャッシュフロー寄与は computeMonth() で算出済。
           詳細な案件管理は左サイドバー「工事案件」ページで行い、
           AI分析プロンプトには全エンティティ統計として自動的に含まれます。 */}
+
+      {/* ====== オーナー向けキャッシュフロー提案書 ====== */}
+      <div className="card" style={{marginTop:16}}>
+        <div className="card-head">
+          <div className="card-head-title">📄 オーナー向けキャッシュフロー提案書</div>
+        </div>
+        <div className="card-body">
+          <div style={{fontSize:13, color:"var(--ink-2)", lineHeight:1.7, marginBottom:14}}>
+            選択したオーナーの全保有物件データを集約し、キャッシュフロー分析・将来予測・改善提案を含む<strong>プロフェッショナルな提案書</strong>を生成します。
+            管理会社からオーナーへの説明資料としてそのまま提出できるレベルです。
+          </div>
+          <div style={{display:"flex", gap:12, alignItems:"flex-end", flexWrap:"wrap", marginBottom:14}}>
+            <div className="form-field" style={{minWidth:240}}>
+              <label className="form-label">対象オーナー <span className="req">●</span></label>
+              <select className="form-select" value={proposalOwnerId} onChange={e => setProposalOwnerId(e.target.value)}>
+                <option value="">--- オーナーを選択 ---</option>
+                {(data.owner||[]).map(o => (
+                  <option key={o.id} value={o.id}>{o.name} ({(data.building||[]).filter(b => b.ownerId === o.id).length}棟)</option>
+                ))}
+              </select>
+            </div>
+            <button className="btn btn-primary" onClick={runProposal}
+                    disabled={proposalState === "running" || !proposalOwnerId || !data.settings?.aiEnabled}>
+              {proposalState === "running" ? "⏳ 提案書生成中... (30〜60秒)" :
+               proposalState === "success" ? "🔄 再生成" :
+                                             "📄 提案書を生成"}
+            </button>
+            {proposalResult && (
+              <button className="btn btn-sm" onClick={() => {
+                const w = window.open("", "_blank", "width=900,height=700");
+                if(!w) return;
+                const ownerName = (data.owner||[]).find(o => o.id === proposalOwnerId)?.name || "";
+                w.document.write(`<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><title>キャッシュフロー提案書 — ${esc(ownerName)} 様</title><style>body{font-family:'Noto Sans JP',sans-serif;max-width:800px;margin:40px auto;padding:0 20px;font-size:14px;line-height:1.8;color:#1a1a2e}h1,h2,h3{margin-top:24px}h1{font-size:20px;border-bottom:2px solid #2563EB;padding-bottom:8px}h2{font-size:16px;color:#2563EB}h3{font-size:14px}ul{padding-left:20px}strong{color:#0F172A}@media print{body{margin:20px}}</style></head><body>${w.document.createElement("div").textContent=""||""}`);
+                // Simple markdown to HTML conversion for print
+                // SECURITY: esc() first to neutralize any HTML in AI response,
+                // then apply markdown→HTML regex (only our regex creates HTML tags)
+                const safeText = esc(proposalResult.response);
+                const html = safeText.replace(/^### (.*$)/gm, '<h3>$1</h3>')
+                  .replace(/^## (.*$)/gm, '<h2>$1</h2>')
+                  .replace(/^# (.*$)/gm, '<h1>$1</h1>')
+                  .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+                  .replace(/^- (.*$)/gm, '<li>$1</li>')
+                  .replace(/(<li>.*<\/li>\n?)+/g, '<ul>$&</ul>')
+                  .replace(/\n\n/g, '</p><p>')
+                  .replace(/\n/g, '<br/>');
+                w.document.write(html + '</body></html>');
+                w.document.close();
+              }}>🖨 印刷用に開く</button>
+            )}
+          </div>
+          {proposalState === "error" && proposalError && (
+            <div style={{padding:"10px 12px", background:"var(--danger-soft)", border:"1px solid var(--danger-border)", borderRadius:8, fontSize:12, color:"var(--danger)"}}>
+              ⚠ {proposalError}
+            </div>
+          )}
+          {!data.settings?.aiEnabled && (
+            <div className="banner warn" style={{fontSize:12}}>
+              AI連携が未設定です。設定 → AI連携設定 から APIキーを登録し、有効化してください。
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ====== 提案書結果表示 ====== */}
+      {proposalResult && (
+        <div className="card" style={{marginTop:16, borderColor:"var(--accent-border)"}}>
+          <div className="card-head">
+            <div className="card-head-title">
+              📄 提案書: {(data.owner||[]).find(o => o.id === proposalResult.ownerId)?.name || ""} 様
+              <span style={{fontSize:11, fontWeight:500, color:"var(--muted)", marginLeft:10}}>
+                {fmtDateTime(proposalResult.createdAt)} / {proposalResult.model}
+              </span>
+            </div>
+          </div>
+          <div className="card-body" style={{fontSize:13, color:"var(--ink-2)"}}>
+            {renderMarkdown(proposalResult.response)}
+
+            {/* フィードバック */}
+            <div style={{marginTop:20, paddingTop:16, borderTop:"1px solid var(--border)"}}>
+              {feedbackOpen !== proposalResult.id ? (
+                <div style={{display:"flex", alignItems:"center", gap:12, flexWrap:"wrap"}}>
+                  <div style={{fontSize:13, fontWeight:600}}>
+                    {proposalResult.reviewStatus === "reviewed" ? "📋 レビュー済" : "💡 この提案書を評価して、次回の精度向上に活かす"}
+                  </div>
+                  {proposalResult.rating && <span style={{color:"var(--warning)", fontSize:16}}>{"★".repeat(proposalResult.rating)}{"☆".repeat(5-(proposalResult.rating||0))}</span>}
+                  <button className="btn btn-sm" onClick={() => openFeedback(proposalResult)}>
+                    {proposalResult.reviewStatus === "reviewed" ? "レビューを更新" : "レビューする"}
+                  </button>
+                </div>
+              ) : (
+                <div>
+                  <div style={{fontWeight:600, marginBottom:8, fontSize:13}}>提案書の評価</div>
+                  <div style={{display:"flex", gap:4, marginBottom:14, alignItems:"center"}}>
+                    {[1,2,3,4,5].map(n => (
+                      <button key={n} onClick={() => setFeedbackRating(n)}
+                              style={{background:"transparent", border:"none", cursor:"pointer", fontSize:24, padding:"0 2px",
+                                      color: feedbackRating >= n ? "var(--warning)" : "var(--border-strong)"}}>{/*★*/}★</button>
+                    ))}
+                  </div>
+                  <div className="form-field full" style={{marginBottom:12}}>
+                    <label className="form-label">訂正・補足</label>
+                    <textarea className="form-textarea" rows="3" value={feedbackCorrection} onChange={e => setFeedbackCorrection(e.target.value)}
+                              placeholder="例: 修繕費の予測は過大。実際は業者Aとの年間契約で固定費化済み。" />
+                  </div>
+                  <div className="form-field full" style={{marginBottom:12}}>
+                    <label className="form-label">コメント</label>
+                    <textarea className="form-textarea" rows="2" value={feedbackComment} onChange={e => setFeedbackComment(e.target.value)}
+                              placeholder="例: オーナー山田様への説明で使用。空室対策の提案が好評だった。" />
+                  </div>
+                  <div style={{display:"flex", gap:8}}>
+                    <button className="btn btn-primary" onClick={() => submitFeedback(proposalResult)}>保存</button>
+                    <button className="btn" onClick={() => setFeedbackOpen(null)}>キャンセル</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }
@@ -3267,16 +3841,17 @@ function BuildingDetailPage({data, buildingId, onBack, onEditBuilding, onNav}) {
   const monthBilled = thisMonthBillings.reduce((s, b) => s + (Number(b.totalAmount)||0), 0);
   const monthReceived = thisMonthBillings.reduce((s, b) => s + (Number(b.paidAmount)||0), 0);
 
-  // Yearly revenue (last 12 months) — plain variable (no useMemo: this is after an early return)
-  let yearlyRevenue = 0;
-  {
+  // Yearly revenue (last 12 months)
+  const yearlyRevenue = useMemo(() => {
     const now = new Date();
+    let total = 0;
     for(let i = 0; i < 12; i++){
       const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
       const y = d.getFullYear(), m = d.getMonth() + 1;
-      yearlyRevenue += billings.filter(b => b.year === y && b.month === m).reduce((s, b) => s + (Number(b.paidAmount)||0), 0);
+      total += billings.filter(b => b.year === y && b.month === m).reduce((s, b) => s + (Number(b.paidAmount)||0), 0);
     }
-  }
+    return total;
+  }, [billings]);
 
   // Expected monthly rent
   const expectedRent = activeContracts.reduce((s, c) => s + (Number(c.rent)||0) + (Number(c.fee)||0), 0);
@@ -3562,10 +4137,10 @@ function SettingsPage({data, onChange}) {
         <div className="card-head"><div className="card-head-title">データ管理</div></div>
         <div className="card-body">
           <div className="banner info" style={{marginBottom:14}}>
-            データはブラウザのIndexedDBに保存されています。<strong>ブラウザのデータ削除やプライベートモード切替で全消失します</strong>。定期的にJSONバックアップを取得してください。
+            データはブラウザのlocalStorageに保存されています。<strong>ブラウザのデータ削除やプライベートモード切替で全消失します</strong>。定期的にJSONバックアップを取得してください。
           </div>
           <div className="kv-grid" style={{marginBottom:14}}>
-            <dt>現在使用量</dt><dd className="tabular">{(getStorageUsage(data)/1024).toFixed(1)} KB <span className="muted" style={{fontSize:11}}>（IndexedDB: 数百MB〜数GB利用可）</span></dd>
+            <dt>現在使用量</dt><dd className="tabular">{(getStorageUsage(data)/1024).toFixed(1)} KB <span className="muted" style={{fontSize:11}}>（目安: 5〜10MB上限）</span></dd>
             <dt>登録件数（合計）</dt><dd className="tabular">{[...ENTITY_ORDER, ...OPS_ORDER, "billing", "payment", "remittance"].reduce((s,k) => s + ((data[k]||[]).length), 0)} 件</dd>
             <dt>操作ログ</dt><dd className="tabular">{(data.auditLog||[]).length} 件 <span className="muted" style={{fontSize:11}}>（1000件超は古い順に自動削除）</span></dd>
           </div>
@@ -3582,7 +4157,7 @@ function SettingsPage({data, onChange}) {
                   try {
                     const parsed = JSON.parse(ev.target.result);
                     if(!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !Array.isArray(parsed.owner)) {
-                      alert("ファイルの形式が不正です。ZENKANのバックアップファイル(JSON)を指定してください。");
+                      alert("ファイルの形式が不正です。Kanri Systemのバックアップファイル(JSON)を指定してください。");
                       return;
                     }
                     if(!confirm(`既存データを置き換えます。\n\n復元元: ${f.name}\n物件数: ${(parsed.building||[]).length} 棟 / 部屋: ${(parsed.room||[]).length} 室\n\nこの操作は元に戻せません。続行しますか？`)) return;
@@ -3855,9 +4430,9 @@ function TerminateContractModal({contract, onClose, onConfirm}) {
   return (
     <div className="modal-backdrop" onClick={(e) => { if(e.target === e.currentTarget) onClose(); }}>
       <div className="modal">
-        <div className="modal-head"><div><div className="modal-kicker">Schedule Termination</div><div className="modal-title">解約予定</div></div><button className="modal-close" onClick={onClose}>×</button></div>
+        <div className="modal-head"><div><div className="modal-kicker">Terminate Contract</div><div className="modal-title">契約解約</div></div><button className="modal-close" onClick={onClose}>×</button></div>
         <div className="modal-body">
-          <div className="banner warn">契約「{contract.contractNo}」({contract.tenantName}) の解約を予定します。解約日が到来すると自動的に解約され、対象部屋は「空室」になります。</div>
+          <div className="banner warn">契約「{contract.contractNo}」({contract.tenantName}) を解約します。対象部屋は「空室」になります。</div>
           <div className="form-grid">
             <div className="form-field"><label className="form-label">解約日 <span className="req">●</span></label><input className="form-input" type="date" value={form.terminationDate} onChange={e => setForm({...form, terminationDate:e.target.value})} /></div>
             <div className="form-field"><label className="form-label">原状回復費 (円)</label><input className="form-input" type="number" value={form.restorationCost} onChange={e => setForm({...form, restorationCost:Number(e.target.value)})} /></div>
@@ -3869,7 +4444,7 @@ function TerminateContractModal({contract, onClose, onConfirm}) {
         </div>
         <div className="modal-foot">
           <button className="btn" onClick={onClose}>キャンセル</button>
-          <button className="btn btn-primary" onClick={() => onConfirm(form)} disabled={!form.terminationDate}>解約予定にする</button>
+          <button className="btn btn-primary" onClick={() => onConfirm(form)} disabled={!form.terminationDate}>解約する</button>
         </div>
       </div>
     </div>
