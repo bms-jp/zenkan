@@ -1,0 +1,5 @@
+_old/
+node_modules/
+supabase/
+.git/
+*.md
