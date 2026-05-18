@@ -1377,7 +1377,7 @@ async function _sbUpsert(tableName, rows){
   if(!rows || rows.length === 0) return {n: 0, error: null};
   const {error} = await supabaseClient
     .from(tableName).upsert(rows, {onConflict:'id'});
-  if(error) console.error(`[Kanri] Supabase upsert (${tableName}):`, error.message);
+  if(error) console.error(`[Kanri] Supabase upsert (${tableName}):`, error.message, error.hint || '', error.details || '', error.code || '');
   return {n: error ? -1 : rows.length, error};
 }
 
@@ -1403,7 +1403,10 @@ async function syncAllToSupabase(data, onProgress){
   const orgId = await _ensureOrgId();
   if(!orgId) return {success:false, reason:'no_org'};
 
+  console.log('[Kanri] syncAllToSupabase start — orgId:', orgId);
+
   const results = {};
+  const errors  = {};
   const keys = Object.keys(SB_TABLE);
   for(let i = 0; i < keys.length; i++){
     const entityKey = keys[i];
@@ -1412,17 +1415,23 @@ async function syncAllToSupabase(data, onProgress){
     const items = data[entityKey] || [];
     if(items.length === 0){ results[entityKey] = 0; continue; }
     const rows = items.map(item => _rowToDb(item, orgId));
+    console.log(`[Kanri] upsert ${tableName}: ${rows.length}件, sample organization_id=`, rows[0]?.organization_id);
     // Supabase の upsert はデフォルト1000件上限。バッチ分割
     let total = 0;
     for(let j = 0; j < rows.length; j += 500){
-      const {n} = await _sbUpsert(tableName, rows.slice(j, j+500));
+      const {n, error} = await _sbUpsert(tableName, rows.slice(j, j+500));
+      if(error){
+        errors[entityKey] = error.message + (error.hint ? ` — ${error.hint}` : '') + (error.code ? ` [${error.code}]` : '');
+      }
       total += Math.max(n, 0);
     }
     results[entityKey] = total;
   }
   await _sbSaveSettings(data.settings, orgId);
   results.settings = 1;
-  return {success:true, results, orgId};
+  const hasErrors = Object.keys(errors).length > 0;
+  if(hasErrors) console.error('[Kanri] syncAllToSupabase errors:', errors);
+  return {success: !hasErrors, results, errors, orgId};
 }
 
 // 差分のみ Supabase に書く（data が変わるたびに呼ばれる background sync）
@@ -5322,10 +5331,11 @@ function BuildingDetailPage({data, buildingId, onBack, onEditBuilding, onNav}) {
    Phase 4 — Supabase 同期セクション
    ========================================================================== */
 function SupabaseSyncSection({data}) {
-  const [syncing, setSyncing]   = useState(false);
-  const [results, setResults]   = useState(null);
-  const [progress, setProgress] = useState(null);
-  const [error, setError]       = useState("");
+  const [syncing, setSyncing]     = useState(false);
+  const [results, setResults]     = useState(null);
+  const [syncErrors, setSyncErrors] = useState(null);
+  const [progress, setProgress]   = useState(null);
+  const [error, setError]         = useState("");
 
   if(!supabaseClient) return null;
 
@@ -5333,13 +5343,19 @@ function SupabaseSyncSection({data}) {
     setSyncing(true);
     setError("");
     setResults(null);
+    setSyncErrors(null);
     setProgress({entityKey:"...", index:0, total:Object.keys(SB_TABLE).length});
     try {
       const result = await syncAllToSupabase(data, (p) => setProgress(p));
-      if(!result.success){
-        setError("同期失敗: " + (result.reason === 'no_org' ? '組織の作成に失敗しました' : result.reason));
+      if(result.reason === 'no_org'){
+        setError("同期失敗: 組織の作成に失敗しました（membersテーブルのRLSポリシーを確認してください）");
+      } else if(result.reason === 'no_client'){
+        setError("同期失敗: Supabase クライアントが初期化されていません");
       } else {
         setResults(result.results);
+        if(result.errors && Object.keys(result.errors).length > 0){
+          setSyncErrors(result.errors);
+        }
       }
     } catch(e){
       setError("同期エラー: " + e.message);
@@ -5375,20 +5391,36 @@ function SupabaseSyncSection({data}) {
 
         {results && (
           <div style={{marginBottom:16}}>
-            <div className="banner success" style={{marginBottom:8}}>同期完了</div>
-            <div style={{display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(140px,1fr))", gap:4}}>
+            {syncErrors
+              ? <div className="banner" style={{marginBottom:8, background:"var(--danger-soft)", color:"var(--danger)", fontWeight:600}}>⚠️ 一部エンティティの同期に失敗しました（下記エラーを確認）</div>
+              : <div className="banner success" style={{marginBottom:8}}>同期完了</div>
+            }
+            <div style={{display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(140px,1fr))", gap:4, marginBottom: syncErrors ? 8 : 0}}>
               {Object.entries(results).map(([key, n]) => {
                 if(key === 'settings') return null;
                 const label = SB_LABELS[key] || key;
-                const icon = n < 0 ? '❌' : '✅';
+                const hasErr = syncErrors && syncErrors[key];
+                const icon = hasErr ? '❌' : (n === 0 && data[key]?.length > 0) ? '⚠️' : '✅';
                 return (
-                  <div key={key} style={{fontSize:12, padding:"3px 6px", borderRadius:4, background:"var(--surface-hover)"}}>
-                    {icon} {label}: {n < 0 ? 'エラー' : `${n}件`}
+                  <div key={key} style={{fontSize:12, padding:"3px 6px", borderRadius:4, background: hasErr ? "var(--danger-soft)" : "var(--surface-hover)", color: hasErr ? "var(--danger)" : undefined}}>
+                    {icon} {label}: {n}件
                   </div>
                 );
               })}
               <div style={{fontSize:12, padding:"3px 6px", borderRadius:4, background:"var(--surface-hover)"}}>✅ 設定: 1件</div>
             </div>
+            {syncErrors && (
+              <div style={{marginTop:8, fontSize:11, lineHeight:1.6}}>
+                {Object.entries(syncErrors).map(([key, msg]) => (
+                  <div key={key} style={{padding:"4px 8px", marginBottom:4, borderRadius:4, background:"var(--danger-soft)", color:"var(--danger)"}}>
+                    <strong>{SB_LABELS[key] || key}</strong>: {msg}
+                  </div>
+                ))}
+                <div style={{marginTop:6, color:"var(--muted)"}}>
+                  💡 RLSポリシーが INSERT/UPSERT をブロックしている可能性があります。Supabase Dashboard → Authentication → Policies を確認してください。
+                </div>
+              </div>
+            )}
           </div>
         )}
 
