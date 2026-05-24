@@ -1276,7 +1276,7 @@ const SB_TABLE = {
   vendor:"vendors", application:"applications", contract:"contracts",
   billing:"billings", payment:"payments", remittance:"remittances",
   vendorPayment:"vendor_payments", ticket:"tickets", repair:"repairs",
-  construction:"constructions", auditLog:"audit_logs",
+  construction:"constructions", aiAnalysis:"ai_analyses", auditLog:"audit_logs",
 };
 const SB_LABELS = {
   owner:"家主", building:"建物", room:"部屋", tenant:"契約者", vendor:"取引業者",
@@ -1480,7 +1480,7 @@ async function _bgSyncToSupabase(curr){
 
   const promises = [];
   for(const entityKey of Object.keys(SB_TABLE)){
-    if(entityKey === 'auditLog') continue; // append-only テーブルのため別処理
+    if(entityKey === 'auditLog' || entityKey === 'aiAnalysis') continue; // insert-only 別処理
     if(curr[entityKey] !== prev[entityKey]){
       const rows = (curr[entityKey]||[]).map(item => _rowToDb(item, _cachedOrgId));
       if(rows.length > 0) promises.push(_sbUpsert(SB_TABLE[entityKey], rows).catch(e=>console.error('[Kanri] bg sync',entityKey,e)));
@@ -1496,6 +1496,19 @@ async function _bgSyncToSupabase(curr){
         supabaseClient.from('audit_logs').insert(rows)
           .then(({error}) => { if(error) console.error('[Kanri] bg sync auditLog', error.message); })
           .catch(e => console.error('[Kanri] bg sync auditLog', e))
+      );
+    }
+  }
+  // aiAnalysis: 新規エントリのみ UPSERT ignoreDuplicates（分析結果は追記のみ）
+  if(curr.aiAnalysis !== prev.aiAnalysis){
+    const prevIds = new Set((prev.aiAnalysis||[]).map(x => x.id));
+    const newItems = (curr.aiAnalysis||[]).filter(x => !prevIds.has(x.id));
+    if(newItems.length > 0){
+      const rows = newItems.map(item => _rowToDb(item, _cachedOrgId));
+      promises.push(
+        supabaseClient.from('ai_analyses').upsert(rows, {onConflict:'id', ignoreDuplicates:true})
+          .then(({error}) => { if(error) console.error('[Kanri] bg sync aiAnalysis', error.message); })
+          .catch(e => console.error('[Kanri] bg sync aiAnalysis', e))
       );
     }
   }
@@ -1736,7 +1749,7 @@ function buildRemittanceHtml(remittance, data){
 const newId = (p) => `${p}_${Date.now().toString(36)}${Math.random().toString(36).slice(2,6)}`;
 
 const fmtMoney = (n) => { if(n===""||n==null||isNaN(Number(n))) return "—"; return "¥"+Number(n).toLocaleString("ja-JP"); };
-const fmtDate = (s) => { if(!s) return "—"; const d = new Date(s); if(isNaN(d)) return s; return `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,"0")}/${String(d.getDate()).padStart(2,"0")}`; };
+const fmtDate = (s) => { if(!s) return "—"; const d = new Date(s); if(isNaN(d)) return "—"; return `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,"0")}/${String(d.getDate()).padStart(2,"0")}`; };
 const fmtDateTime = (s) => { if(!s) return "—"; const d = new Date(s); if(isNaN(d)) return s; return `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,"0")}/${String(d.getDate()).padStart(2,"0")} ${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`; };
 const fmtYM = (y,m) => `${y}年${String(m).padStart(2,"0")}月`;
 const currentYM = () => { const d=new Date(); return {year:d.getFullYear(),month:d.getMonth()+1}; };
@@ -2225,14 +2238,16 @@ function buildCrossEntityStats(data) {
     }
   }
 
-  // --- 入金状況 ---
+  // --- 入金状況 (直近6ヶ月) ---
   if(billings.length > 0) {
-    const totalBilled = billings.reduce((s,b)=>s+(Number(b.totalAmount)||0), 0);
-    const totalPaid = billings.reduce((s,b)=>s+(Number(b.paidAmount)||0), 0);
+    const _6mAgo = (() => { const d = new Date(); d.setMonth(d.getMonth()-6); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-01`; })();
+    const recentBillings = billings.filter(b => (b.dueDate||b.billingDate||"") >= _6mAgo);
+    const totalBilled = recentBillings.reduce((s,b)=>s+(Number(b.totalAmount)||0), 0);
+    const totalPaid = recentBillings.reduce((s,b)=>s+(Number(b.paidAmount)||0), 0);
     const collRate = totalBilled > 0 ? ((totalPaid/totalBilled)*100).toFixed(1) : 0;
-    const overdue = billings.filter(b => b.status === "未収" || b.status === "一部入金").length;
-    L.push(`### 入金状況`);
-    L.push(`- 累計請求額: ${fmtY(totalBilled)} / 累計入金額: ${fmtY(totalPaid)} (収納率 ${collRate}%)`);
+    const overdue = recentBillings.filter(b => b.status === "未収" || b.status === "一部入金").length;
+    L.push(`### 入金状況 (直近6ヶ月)`);
+    L.push(`- 直近6ヶ月請求額: ${fmtY(totalBilled)} / 同期間入金額: ${fmtY(totalPaid)} (収納率 ${collRate}%)`);
     if(overdue > 0) L.push(`- 未収・一部入金: ${overdue}件`);
   }
 
@@ -2430,7 +2445,7 @@ function buildLearningContext(aiAnalyses) {
   const reviewed = (aiAnalyses||[])
     .filter(a => a.reviewStatus === "reviewed" && (a.rating >= 3 || a.corrections || a.reviewerComment))
     .sort((a,b) => (b.createdAt||"").localeCompare(a.createdAt||""))
-    .slice(0, 6);
+    .slice(-3);
   if(reviewed.length === 0) return "";
   const L = [];
   L.push(`## 過去の分析履歴と人間によるフィードバック (これらを踏まえて精度を上げてください)`);
