@@ -1409,6 +1409,17 @@ async function syncAllToSupabase(data, onProgress){
     if(items.length === 0){ results[entityKey] = 0; continue; }
     const rows = items.map(item => _rowToDb(item, orgId));
     console.log(`[Kanri] upsert ${tableName}: ${rows.length}件, sample organization_id=`, rows[0]?.organization_id);
+    // audit_logs は append-only のため INSERT ON CONFLICT DO NOTHING
+    if(entityKey === 'auditLog'){
+      let total = 0;
+      for(let j = 0; j < rows.length; j += 500){
+        const {error} = await supabaseClient.from('audit_logs').upsert(rows.slice(j, j+500), {onConflict:'id', ignoreDuplicates:true});
+        if(error) errors[entityKey] = error.message + (error.hint ? ` — ${error.hint}` : '') + (error.code ? ` [${error.code}]` : '');
+        else total += rows.slice(j, j+500).length;
+      }
+      results[entityKey] = total;
+      continue;
+    }
     // Supabase の upsert はデフォルト1000件上限。バッチ分割
     let total = 0;
     for(let j = 0; j < rows.length; j += 500){
