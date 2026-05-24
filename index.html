@@ -1437,10 +1437,23 @@ async function _bgSyncToSupabase(curr){
 
   const promises = [];
   for(const entityKey of Object.keys(SB_TABLE)){
+    if(entityKey === 'auditLog') continue; // append-only テーブルのため別処理
     if(curr[entityKey] !== prev[entityKey]){
       const rows = (curr[entityKey]||[]).map(item => _rowToDb(item, _cachedOrgId));
-      // 削除は未対応（削除はIDB側のみ; 完全反映は sync ボタンで）
       if(rows.length > 0) promises.push(_sbUpsert(SB_TABLE[entityKey], rows).catch(e=>console.error('[Kanri] bg sync',entityKey,e)));
+    }
+  }
+  // auditLog: 新規エントリのみ INSERT（append-only テーブルのため UPSERT 不可）
+  if(curr.auditLog !== prev.auditLog){
+    const prevIds = new Set((prev.auditLog||[]).map(x => x.id));
+    const newLogs = (curr.auditLog||[]).filter(x => !prevIds.has(x.id));
+    if(newLogs.length > 0){
+      const rows = newLogs.map(item => _rowToDb(item, _cachedOrgId));
+      promises.push(
+        supabaseClient.from('audit_logs').insert(rows)
+          .then(({error}) => { if(error) console.error('[Kanri] bg sync auditLog', error.message); })
+          .catch(e => console.error('[Kanri] bg sync auditLog', e))
+      );
     }
   }
   if(curr.settings !== prev.settings){
@@ -2886,6 +2899,10 @@ function App({ session }) {
       return addAudit({...prev, [entityKey]: prev[entityKey].filter(x => x.id !== id)}, "delete", cfg?.label||entityKey, `${cfg?.label||entityKey}「${label}」を削除`);
     });
     setConfirmDelete(null);
+    if(supabaseClient && SB_TABLE[entityKey]){
+      supabaseClient.from(SB_TABLE[entityKey]).delete().eq('id', id)
+        .then(({error}) => { if(error) console.error('[Kanri] Supabase delete', entityKey, id, error.message); });
+    }
   }, []);
 
   const handleApproveApplication = useCallback((appId, contractData) => {
