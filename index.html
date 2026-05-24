@@ -1126,7 +1126,7 @@ const DEFAULT_SETTINGS = {
   companyName: "○○管理株式会社", managementFeeRate: 5, consumptionTaxRate: 10, defaultDueDay: 27, bankAccount: "",
   // AI連携 (BMS Gateway経由 / "direct"でAnthropicAPIに切替可)
   aiEnabled: true,
-  aiEndpoint: "http://localhost:8000/v1/ai/claude/messages",
+  aiEndpoint: "https://api.anthropic.com/v1/messages",
   aiApiKey: "REMOVED_API_KEY",
   aiModel: "claude-sonnet-4-6",
   aiAuthMode: "gateway",
@@ -1200,7 +1200,7 @@ function _validateData(p){
       if(!merged.aiApiKey || merged.aiEndpoint === "https://api.anthropic.com/v1/messages") {
         merged.aiEnabled = true;
         merged.aiAuthMode = "gateway";
-        merged.aiEndpoint = "http://localhost:8000/v1/ai/claude/messages";
+        merged.aiEndpoint = "https://api.anthropic.com/v1/messages";
         merged.aiApiKey = "REMOVED_API_KEY";
         merged.aiModel = "claude-sonnet-4-6";
       }
