@@ -3294,7 +3294,7 @@ function Dashboard({data, counts, onSeed, onClear, onNav}) {
           <div className="page-subtitle">{fmtYM(year,month)} 時点の管理ポートフォリオ概況</div>
         </div>
         <div className="page-actions">
-          {counts.owner === 0 ? <button className="btn btn-primary" onClick={onSeed}>サンプルデータを投入</button> : (
+          {(counts.owner === 0 && counts.building === 0 && counts.room === 0 && counts.tenant === 0) ? <button className="btn btn-primary" onClick={onSeed}>サンプルデータを投入</button> : (
             <><button className="btn" onClick={onSeed}>サンプル追加投入</button><button className="btn btn-danger" onClick={onClear}>全データ削除</button></>
           )}
         </div>
@@ -5634,7 +5634,7 @@ ${JSON.stringify(sampleRows, null, 2)}
         if (pk && item[pk] && existingPKs.has(item[pk])) { skipped++; return; }
         newItems.push(item);
         added++;
-      } catch(e) { errors++; }
+      } catch(e) { errors++; console.error('[CSV Import] 行処理エラー:', e.message, row); }
     });
     onBulkImport(entity, newItems);
     setResult({added, skipped, errors, total: previewData.length});
