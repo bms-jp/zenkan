@@ -1196,14 +1196,7 @@ function _validateData(p){
     if(k === "settings") {
       const merged = (p.settings && typeof p.settings === "object" && !Array.isArray(p.settings))
         ? {...DEFAULT_SETTINGS, ...p.settings} : {...DEFAULT_SETTINGS};
-      // APIキー未設定 or 古いAnthropicデフォルトのまま → BMS Gatewayに自動切替
-      if(!merged.aiApiKey || merged.aiEndpoint === "https://api.anthropic.com/v1/messages") {
-        merged.aiEnabled = true;
-        merged.aiAuthMode = "gateway";
-        merged.aiEndpoint = "https://api.anthropic.com/v1/messages";
-        merged.aiApiKey = "REMOVED_API_KEY";
-        merged.aiModel = "claude-sonnet-4-6";
-      }
+
       result.settings = merged;
     } else {
       // Entity arrays: filter out null/non-object/array elements
@@ -1991,7 +1984,7 @@ async function callClaudeApi(prompt, settings) {
 
   const headers = {
     "content-type": "application/json",
-    "anthropic-version": "2023-06-01",
+    "anthropic-version": "2025-01-01",
   };
   if(authMode === "gateway") {
     // BMS Gateway: mks_ キーは X-API-Key ヘッダ、at_ トークンは Authorization: Bearer
